@@ -18,6 +18,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-is/18.2.0/umd/react-is.production.min.js"></script>
 <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>html,body{margin:0;background:#241712;}</style>
@@ -30,12 +31,12 @@
 // 1) PASTE YOUR FIREBASE CONFIG HERE — from Firebase Console > Project settings > General > Your apps
 // =====================================================================
 const FIREBASE_CONFIG = {
-  apiKey: "AIzaSyAhjsN865LjAogYGr34iksnR5GQi0jwSR4",
-  authDomain: "csvmachine-f0fa2.firebaseapp.com",
-  projectId: "csvmachine-f0fa2",
-  storageBucket: "csvmachine-f0fa2.firebasestorage.app",
-  messagingSenderId: "952984321560",
-  appId: "1:952984321560:web:88ce32828b8d2218270d6d",
+  apiKey: "AIzaSyCPcr48Fd2SrI7FzvpSBP3Onsf8krR_0dw",
+  authDomain: "quickneeds-erp.firebaseapp.com",
+  projectId: "quickneeds-erp",
+  storageBucket: "quickneeds-erp.firebasestorage.app",
+  messagingSenderId: "851116442669",
+  appId: "1:851116442669:web:a679514fd567e57c99e4a4",
 };
 
 firebase.initializeApp(FIREBASE_CONFIG);
@@ -75,7 +76,14 @@ window.storage = {
 const { useState, useEffect, useMemo } = React;
 const Papa = window.Papa;
 const XLSX = window.XLSX;
-const { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } = Recharts;
+const RC = window.Recharts || {};
+const BarChart = RC.BarChart || (() => null);
+const Bar = RC.Bar || (() => null);
+const XAxis = RC.XAxis || (() => null);
+const YAxis = RC.YAxis || (() => null);
+const CartesianGrid = RC.CartesianGrid || (() => null);
+const Tooltip = RC.Tooltip || (() => null);
+const ResponsiveContainer = RC.ResponsiveContainer || (({ children }) => children || null);
 
 function mkIcon(glyph) {
   return function Icon({ size = 16, color = "currentColor", className = "", style = {}, ...rest }) {
