@@ -19,6 +19,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-is/18.2.0/umd/react-is.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
 <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>html,body{margin:0;background:#241712;}</style>
@@ -74,8 +75,8 @@ window.storage = {
 
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo } = React;
-const Papa = window.Papa;
-const XLSX = window.XLSX;
+// Papa and XLSX are already global (set by their CDN <script> tags) — do NOT redeclare them here,
+// redeclaring a global that a library script already declared throws a SyntaxError and kills this whole script.
 const RC = window.Recharts || {};
 const BarChart = RC.BarChart || (() => null);
 const Bar = RC.Bar || (() => null);
