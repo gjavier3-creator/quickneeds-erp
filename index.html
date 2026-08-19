@@ -1,0 +1,1841 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-title" content="QuickNeeds" />
+<meta name="theme-color" content="#241712" />
+<title>QuickNeeds ERP</title>
+
+<!-- Firebase (compat build — no bundler needed, works as plain script tags) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>html,body{margin:0;background:#241712;}</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+// =====================================================================
+// 1) PASTE YOUR FIREBASE CONFIG HERE — from Firebase Console > Project settings > General > Your apps
+// =====================================================================
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyAhjsN865LjAogYGr34iksnR5GQi0jwSR4",
+  authDomain: "csvmachine-f0fa2.firebaseapp.com",
+  projectId: "csvmachine-f0fa2",
+  storageBucket: "csvmachine-f0fa2.firebasestorage.app",
+  messagingSenderId: "952984321560",
+  appId: "1:952984321560:web:88ce32828b8d2218270d6d",
+};
+
+firebase.initializeApp(FIREBASE_CONFIG);
+const db = firebase.firestore();
+const KV_COLLECTION = "quickneeds_kv"; // all app data is stored as one doc per key in this collection
+
+// Storage shim: gives the app the same window.storage.get/set/delete/list API it uses inside Claude,
+// backed by Firestore instead — so no app code below needed to change.
+window.storage = {
+  get: function (key) {
+    return db.collection(KV_COLLECTION).doc(key).get().then(function (snap) {
+      if (!snap.exists) return null;
+      return { key: key, value: snap.data().value, shared: false };
+    }).catch(function () { return null; });
+  },
+  set: function (key, value) {
+    return db.collection(KV_COLLECTION).doc(key).set({ value: value, updatedAt: Date.now() })
+      .then(function () { return { key: key, value: value, shared: false }; })
+      .catch(function () { return null; });
+  },
+  delete: function (key) {
+    return db.collection(KV_COLLECTION).doc(key).delete()
+      .then(function () { return { key: key, deleted: true, shared: false }; })
+      .catch(function () { return null; });
+  },
+  list: function (prefix) {
+    return db.collection(KV_COLLECTION).get().then(function (snap) {
+      var keys = [];
+      snap.forEach(function (d) { if (!prefix || d.id.indexOf(prefix) === 0) keys.push(d.id); });
+      return { keys: keys, prefix: prefix, shared: false };
+    }).catch(function () { return null; });
+  },
+};
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+const Papa = window.Papa;
+const XLSX = window.XLSX;
+const { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } = Recharts;
+
+function mkIcon(glyph) {
+  return function Icon({ size = 16, color = "currentColor", className = "", style = {}, ...rest }) {
+    return React.createElement(
+      "span",
+      { className, style: { fontSize: size, lineHeight: 1, color, display: "inline-flex", alignItems: "center", justifyContent: "center", width: size, height: size, ...style }, ...rest },
+      glyph
+    );
+  };
+}
+const Coffee = mkIcon("\u2615");
+const AlertTriangle = mkIcon("\u26A0\uFE0F");
+const TrendingUp = mkIcon("\uD83D\uDCC8");
+const Package = mkIcon("\uD83D\uDCE6");
+const Upload = mkIcon("\u2B06\uFE0F");
+const LayoutGrid = mkIcon("\u25A6");
+const RefreshCw = mkIcon("\u21BB");
+const Plus = mkIcon("+");
+const X = mkIcon("\u2715");
+const ChevronRight = mkIcon("\u203A");
+const Trash2 = mkIcon("\uD83D\uDDD1");
+const PlusCircle = mkIcon("\u2295");
+const MinusCircle = mkIcon("\u2296");
+const CheckCircle2 = mkIcon("\u2713");
+const CircleAlert = mkIcon("!");
+const Settings2 = mkIcon("\u2699");
+const Coins = mkIcon("\uD83E\uDE99");
+const Banknote = mkIcon("\uD83D\uDCB5");
+const Droplets = mkIcon("\uD83D\uDCA7");
+const Camera = mkIcon("\uD83D\uDCF7");
+const Sparkles = mkIcon("\u2728");
+
+
+// ---------- Machine layout ----------
+const SLAVE_SLOTS = [
+  101,103,105,107,111,113,115,117,
+  121,122,123,124,125,126,127,
+  131,132,133,134,135,136,137,138,139,140,
+  141,142,143,144,145,146,147,
+  151,152,153,154,155,156,157,158,159,160
+];
+
+function zoneOfSlot(slot) {
+  const n = Number(slot);
+  if (n >= 1 && n <= 100) return "main";
+  if (SLAVE_SLOTS.includes(n)) return "slave";
+  return "unknown";
+}
+
+// ---------- Cash acceptor: bills in, coin-only change out ----------
+const BILL_DENOMS = [20, 50, 100];
+const COIN_DENOM = 5;
+const DEFAULT_COIN_CHANGER = { capacity: 200, current: 0, threshold: 40, log: [] };
+
+// ---------- Real machine data (from OurVend Replenishment management screens) ----------
+const REAL_MAIN_PRODUCTS = [
+  { slot: "1", name: "Americano", price: 50 },
+  { slot: "2", name: "With Sugar", price: 50 },
+  { slot: "3", name: "Cafe Latte", price: 50 },
+  { slot: "4", name: "Cappuccino", price: 30 },
+  { slot: "5", name: "Matcha", price: 50 },
+  { slot: "6", name: "Dirty Matcha", price: 80 },
+  { slot: "7", name: "Hot Cocoa", price: 50 },
+  { slot: "8", name: "Long Black", price: 50 },
+  { slot: "9", name: "Long Black w/ Sugar", price: 50 },
+  { slot: "10", name: "Premium Latte", price: 70 },
+  { slot: "11", name: "Matcha Latte", price: 70 },
+  { slot: "12", name: "Premium Mix", price: 25 },
+  { slot: "13", name: "Cappuccino (Large)", price: 30 },
+];
+const REAL_SLAVE_PRODUCTS = [
+  { slot: 101, name: "Marty's Spicy", price: 35, capacity: 4, stock: 3 },
+  { slot: 103, name: "Marty's Spicy", price: 35, capacity: 3, stock: 3 },
+  { slot: 105, name: "Marty's Salt & Vinegar", price: 35, capacity: 3, stock: 3 },
+  { slot: 107, name: "Moby Choco", price: 50, capacity: 4, stock: 3 },
+  { slot: 111, name: "Snacku", price: 25, capacity: 2, stock: 2 },
+  { slot: 113, name: "Oishi Spicy", price: 25, capacity: 5, stock: 5 },
+  { slot: 115, name: "MJ ChikN' Skin", price: 35, capacity: 3, stock: 3 },
+  { slot: 117, name: "Calbee Honey Butter", price: 30, capacity: 5, stock: 2 },
+  { slot: 121, name: "Snickers", price: 50, capacity: 6, stock: 3 },
+  { slot: 122, name: "Snickers", price: 50, capacity: 5, stock: 3 },
+  { slot: 123, name: "Snickers", price: 50, capacity: 5, stock: 2 },
+  { slot: 124, name: "KitKat", price: 50, capacity: 2, stock: 2 },
+  { slot: 125, name: "Crossini", price: 20, capacity: 5, stock: 0 },
+  { slot: 126, name: "Crossini", price: 20, capacity: 5, stock: 3 },
+  { slot: 127, name: "Mentos Grapes", price: 50, capacity: 1, stock: 1 },
+  { slot: 131, name: "Sting Energy Drink", price: 30, capacity: 5, stock: 5 },
+  { slot: 132, name: "Cobra Energy", price: 30, capacity: 5, stock: 5 },
+  { slot: 133, name: "Cobra Citrus Blast", price: 30, capacity: 5, stock: 5 },
+  { slot: 134, name: "Summit 500ml", price: 20, capacity: 5, stock: 4 },
+  { slot: 135, name: "Summit 500ml", price: 20, capacity: 5, stock: 4 },
+  { slot: 136, name: "Summit 500ml", price: 20, capacity: 5, stock: 5 },
+  { slot: 137, name: "Summit 500ml", price: 20, capacity: 5, stock: 4 },
+  { slot: 138, name: "Gatorade", price: 50, capacity: 4, stock: 4 },
+  { slot: 139, name: "Gatorade", price: 50, capacity: 4, stock: 4 },
+  { slot: 140, name: "Gatorade", price: 50, capacity: 3, stock: 3 },
+  { slot: 141, name: "Lays Yellow", price: 50, capacity: 4, stock: 4 },
+  { slot: 142, name: "Lays Green", price: 50, capacity: 2, stock: 2 },
+  { slot: 143, name: "Musli Strawberry", price: 50, capacity: 5, stock: 5 },
+  { slot: 144, name: "Musli Chocolate", price: 50, capacity: 5, stock: 5 },
+  { slot: 145, name: "Del Monte ACE", price: 50, capacity: 4, stock: 4 },
+  { slot: 146, name: "Del Monte", price: 50, capacity: 3, stock: 3 },
+  { slot: 147, name: "Kombucha", price: 100, capacity: 5, stock: 5 },
+  { slot: 151, name: "Coke Vanilla", price: 50, capacity: 5, stock: 4 },
+  { slot: 152, name: "Coke Vanilla", price: 50, capacity: 5, stock: 4 },
+  { slot: 153, name: "Royal Zero Calorie", price: 50, capacity: 5, stock: 3 },
+  { slot: 154, name: "Pepsi Lime", price: 50, capacity: 5, stock: 1 },
+  { slot: 155, name: "Mug Rootbeer", price: 50, capacity: 5, stock: 4 },
+  { slot: 156, name: "Coke Zero Calorie", price: 50, capacity: 5, stock: 5 },
+  { slot: 157, name: "Sprite Zero Calorie", price: 50, capacity: 5, stock: 5 },
+  { slot: 158, name: "Coke Original", price: 50, capacity: 5, stock: 5 },
+  { slot: 159, name: "Pocari Sweat", price: 50, capacity: 5, stock: 4 },
+  { slot: 160, name: "Pocari Sweat", price: 50, capacity: 5, stock: 5 },
+];
+// The main cabinet's 13 coffee recipes draw from a SHARED material box, not per-slot stock —
+// tracked separately below as ingredients, matching the machine's own "Replenishment management" screen.
+const REAL_INGREDIENTS = [
+  { name: "Coffee bean", unit: "g", quantity: 713, warningValue: 200 },
+  { name: "Water", unit: "ml", quantity: 29205, warningValue: 200 },
+  { name: "Sugar", unit: "g", quantity: 942, warningValue: 200 },
+  { name: "Milk", unit: "g", quantity: 604, warningValue: 200 },
+  { name: "Chocolate", unit: "g", quantity: 1540, warningValue: 200 },
+  { name: "Matcha", unit: "g", quantity: 1474, warningValue: 200 },
+  { name: "Cappuccino powder", unit: "g", quantity: 1482, warningValue: 200 },
+  { name: "Premium powder", unit: "g", quantity: 945, warningValue: 200 },
+  { name: "Cups", unit: "pcs", quantity: 49, warningValue: 10 },
+  { name: "Cup covers", unit: "pcs", quantity: 0, warningValue: 10 },
+];
+
+// ---------- Palette (grounded in the machine: espresso body, copper trim, coin-slot red) ----------
+const C = {
+  bg: "#241712",
+  panel: "#2F1F17",
+  panel2: "#3A281E",
+  line: "#4A3628",
+  cream: "#F1E6D8",
+  muted: "#B9A491",
+  copper: "#C68A3E",
+  copperBright: "#E3A75A",
+  red: "#C0392B",
+  redSoft: "#5A2A22",
+  sage: "#7C9470",
+  sageSoft: "#2C3728",
+};
+
+const uid = () => Math.random().toString(36).slice(2, 10);
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const peso = (n) =>
+  "₱" + Number(n || 0).toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+function daysAgo(n) {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return d.toISOString().slice(0, 10);
+}
+
+// ---------- Storage helpers ----------
+async function loadJSON(key, fallback) {
+  try {
+    const r = await window.storage.get(key, false);
+    return r ? JSON.parse(r.value) : fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+async function saveJSON(key, value) {
+  try {
+    await window.storage.set(key, JSON.stringify(value), false);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result.split(",")[1]);
+    r.onerror = () => reject(new Error("Could not read file"));
+    r.readAsDataURL(file);
+  });
+}
+
+function QuickNeedsERP() {
+  const [loading, setLoading] = useState(true);
+  const [products, setProducts] = useState([]);
+  const [sales, setSales] = useState([]);
+  const [coinChanger, setCoinChanger] = useState(DEFAULT_COIN_CHANGER);
+  const [ingredients, setIngredients] = useState([]);
+  const [expenses, setExpenses] = useState([]);
+  const [faults, setFaults] = useState([]);
+  const [tab, setTab] = useState("dashboard");
+  const [zoneFilter, setZoneFilter] = useState("all");
+  const [period, setPeriod] = useState(7);
+  const [error, setError] = useState("");
+  const [toast, setToast] = useState("");
+  const [slotEditor, setSlotEditor] = useState(null); // { zone, slot, product, allowSlotChange } | null
+
+  useEffect(() => {
+    (async () => {
+      const [p, s, c, ing, exp, flt] = await Promise.all([
+        loadJSON("quickneeds:products", []),
+        loadJSON("quickneeds:sales", []),
+        loadJSON("quickneeds:coins", DEFAULT_COIN_CHANGER),
+        loadJSON("quickneeds:ingredients", []),
+        loadJSON("quickneeds:expenses", []),
+        loadJSON("quickneeds:faults", []),
+      ]);
+      setProducts(p);
+      setSales(s);
+      setCoinChanger(c);
+      setIngredients(ing);
+      setExpenses(exp);
+      setFaults(flt);
+      setLoading(false);
+    })();
+  }, []);
+
+  function flash(msg) {
+    setToast(msg);
+    setTimeout(() => setToast(""), 2200);
+  }
+
+  async function persistProducts(next) {
+    setProducts(next);
+    const ok = await saveJSON("quickneeds:products", next);
+    if (!ok) setError("Could not save product changes. They may not persist.");
+  }
+  async function persistSales(next) {
+    setSales(next);
+    const ok = await saveJSON("quickneeds:sales", next);
+    if (!ok) setError("Could not save sales changes. They may not persist.");
+  }
+  async function persistCoinChanger(next) {
+    setCoinChanger(next);
+    const ok = await saveJSON("quickneeds:coins", next);
+    if (!ok) setError("Could not save coin changer changes. They may not persist.");
+  }
+  async function persistIngredients(next) {
+    setIngredients(next);
+    const ok = await saveJSON("quickneeds:ingredients", next);
+    if (!ok) setError("Could not save ingredient changes. They may not persist.");
+  }
+  function updateIngredient(id, patch) {
+    persistIngredients(ingredients.map((i) => (i.id === id ? { ...i, ...patch } : i)));
+  }
+  function refillIngredient(id, addQty) {
+    persistIngredients(ingredients.map((i) => (i.id === id ? { ...i, quantity: i.quantity + addQty } : i)));
+    flash(`Refilled`);
+  }
+
+  function loadRealMachineData() {
+    const existingBySlot = new Set(products.map((p) => String(p.slot)));
+    const newMain = REAL_MAIN_PRODUCTS.filter((r) => !existingBySlot.has(String(r.slot))).map((r) => ({
+      id: uid(), zone: "main", slot: String(r.slot), name: r.name, price: r.price, cost: 0,
+      stock: 999, reorderPoint: 0,
+    }));
+    const newSlave = REAL_SLAVE_PRODUCTS.filter((r) => !existingBySlot.has(String(r.slot))).map((r) => ({
+      id: uid(), zone: "slave", slot: String(r.slot), name: r.name, price: r.price, cost: 0,
+      stock: r.stock, reorderPoint: Math.max(1, Math.ceil(r.capacity * 0.3)), capacity: r.capacity,
+    }));
+    const addedProducts = newMain.length + newSlave.length;
+    if (addedProducts) persistProducts([...products, ...newMain, ...newSlave]);
+
+    let addedIngredients = 0;
+    if (ingredients.length === 0) {
+      persistIngredients(REAL_INGREDIENTS.map((r) => ({ id: uid(), ...r })));
+      addedIngredients = REAL_INGREDIENTS.length;
+    }
+    if (!addedProducts && !addedIngredients) flash("Your real machine data is already loaded");
+    else flash(`Loaded ${addedProducts} slots and ${addedIngredients} ingredients from your machine`);
+  }
+
+  // Upsert helpers used by both the CSV importer's "products" side (future use) and photo import
+  function mergeProductRows(rows) {
+    const bySlot = new Map(products.map((p) => [String(p.slot), p]));
+    const next = [];
+    let added = 0, updated = 0, skipped = 0;
+    const seen = new Set();
+    for (const r of rows) {
+      if (!r.slot) { skipped++; continue; }
+      const zone = zoneOfSlot(r.slot);
+      if (zone === "unknown") { skipped++; continue; }
+      seen.add(String(r.slot));
+      const existing = bySlot.get(String(r.slot));
+      if (existing) {
+        bySlot.set(String(r.slot), {
+          ...existing,
+          name: r.name ?? existing.name,
+          price: r.price != null ? Number(r.price) : existing.price,
+          capacity: r.capacity != null ? Number(r.capacity) : existing.capacity,
+          stock: r.stock != null ? Number(r.stock) : existing.stock,
+        });
+        updated++;
+      } else {
+        const capacity = r.capacity != null ? Number(r.capacity) : undefined;
+        bySlot.set(String(r.slot), {
+          id: uid(), zone, slot: String(r.slot), name: r.name || `Slot ${r.slot}`,
+          price: r.price != null ? Number(r.price) : 0, cost: 0,
+          stock: r.stock != null ? Number(r.stock) : zone === "main" ? 999 : capacity || 5,
+          reorderPoint: zone === "main" ? 0 : Math.max(1, Math.ceil((capacity || 5) * 0.3)),
+          capacity,
+        });
+        added++;
+      }
+    }
+    persistProducts(Array.from(bySlot.values()));
+    return { added, updated, skipped };
+  }
+  function mergeIngredientRows(rows) {
+    const byName = new Map(ingredients.map((i) => [i.name.toLowerCase(), i]));
+    let added = 0, updated = 0;
+    for (const r of rows) {
+      if (!r.name) continue;
+      const key = r.name.toLowerCase();
+      const existing = byName.get(key);
+      if (existing) {
+        byName.set(key, {
+          ...existing,
+          quantity: r.quantity != null ? Number(r.quantity) : existing.quantity,
+          unit: r.unit || existing.unit,
+          warningValue: r.warningValue != null ? Number(r.warningValue) : existing.warningValue,
+        });
+        updated++;
+      } else {
+        byName.set(key, { id: uid(), name: r.name, unit: r.unit || "", quantity: Number(r.quantity) || 0, warningValue: Number(r.warningValue) || 0 });
+        added++;
+      }
+    }
+    persistIngredients(Array.from(byName.values()));
+    return { added, updated };
+  }
+
+  function refillCoins(qty, note) {
+    if (!qty) return;
+    const entry = { id: uid(), date: new Date().toISOString(), type: "refill", coins: qty, note: note || "Manual refill" };
+    persistCoinChanger({
+      ...coinChanger,
+      current: Math.min(coinChanger.capacity, coinChanger.current + qty),
+      log: [entry, ...coinChanger.log].slice(0, 200),
+    });
+    flash(`Added ${qty} coins to the changer`);
+  }
+  function dispenseCoins(qty, note) {
+    if (!qty) return;
+    const entry = { id: uid(), date: new Date().toISOString(), type: "dispense", coins: qty, note: note || "Change given" };
+    setCoinChanger((cur) => {
+      const next = { ...cur, current: Math.max(0, cur.current - qty), log: [entry, ...cur.log].slice(0, 200) };
+      saveJSON("quickneeds:coins", next);
+      return next;
+    });
+  }
+  function updateCoinSettings(patch) {
+    persistCoinChanger({ ...coinChanger, ...patch });
+  }
+
+  async function persistExpenses(next) {
+    setExpenses(next);
+    const ok = await saveJSON("quickneeds:expenses", next);
+    if (!ok) setError("Could not save expense changes. They may not persist.");
+  }
+  function addExpense(amount, note) {
+    if (!amount) return;
+    const entry = { id: uid(), date: new Date().toISOString(), amount: Number(amount), note: note || "Expense" };
+    persistExpenses([entry, ...expenses]);
+    flash(`Logged expense: ${peso(amount)}`);
+  }
+  function deleteExpense(id) {
+    persistExpenses(expenses.filter((e) => e.id !== id));
+  }
+  async function persistFaults(next) {
+    setFaults(next);
+    const ok = await saveJSON("quickneeds:faults", next);
+    if (!ok) setError("Could not save fault log. It may not persist.");
+  }
+
+  // Import straight from the machine's own export files (Give-out record .xls, Money record .csv).
+  // Give-out record = the real per-vend transaction log (slot, price, result, timestamp).
+  // Money record = bill-in / coin-change events, used to keep the coin changer accurate automatically.
+  function importMachineFiles(parsedFiles) {
+    let salesAdded = 0, faultsAdded = 0, coinsFromFile = 0, coinsUsed = false, unrecognized = 0;
+    const stockDelta = {};
+    const newSales = [];
+    const newFaults = [];
+
+    for (const { kind, rows } of parsedFiles) {
+      if (kind === "giveout") {
+        for (const r of rows) {
+          const slot = r["Slot Number"];
+          const price = Number(r["Price"]) || 0;
+          const result = String(r["Result"] || "Normal").trim();
+          const when = r["Machine Time"] || r["Server Time"];
+          const date = when ? new Date(when).toISOString() : new Date().toISOString();
+          if (!slot) continue;
+          if (result.toLowerCase() !== "normal") {
+            newFaults.push({ id: uid(), date, slot: String(slot), amount: price, note: `Failed give-out, slot ${slot}` });
+            faultsAdded++;
+            continue;
+          }
+          const product = products.find((p) => String(p.slot) === String(slot));
+          newSales.push({
+            id: uid(), date, slot: String(slot), zone: zoneOfSlot(slot),
+            productId: product ? product.id : null, name: product ? product.name : `Slot ${slot}`,
+            qty: 1, amount: price, bill: null,
+          });
+          if (product) stockDelta[product.id] = (stockDelta[product.id] || 0) + 1;
+          salesAdded++;
+        }
+      } else if (kind === "money") {
+        coinsUsed = true;
+        for (const r of rows) {
+          const type = String(r["Type"] || r["Type_1"] || "").toLowerCase();
+          const refunded = Number(r["Amount to be refunded"]) || 0;
+          if (type.includes("return")) coinsFromFile += Math.floor(refunded / COIN_DENOM);
+        }
+      } else {
+        unrecognized++;
+      }
+    }
+
+    if (newSales.length) persistSales([...newSales, ...sales]);
+    if (Object.keys(stockDelta).length) {
+      persistProducts(products.map((p) => (stockDelta[p.id] ? { ...p, stock: Math.max(0, p.stock - stockDelta[p.id]) } : p)));
+    }
+    if (newFaults.length) persistFaults([...newFaults, ...faults]);
+    if (coinsFromFile > 0) dispenseCoins(coinsFromFile, "From Money record import");
+
+    const parts = [];
+    if (salesAdded) parts.push(`${salesAdded} sales`);
+    if (faultsAdded) parts.push(`${faultsAdded} failed dispenses flagged`);
+    if (coinsUsed) parts.push(`${coinsFromFile} coins tracked`);
+    if (unrecognized) parts.push(`${unrecognized} file(s) not recognized`);
+    flash(parts.length ? `Imported: ${parts.join(", ")}` : "Nothing new to import");
+    return { salesAdded, faultsAdded, coinsFromFile, unrecognized };
+  }
+
+  function openNewSlot() {
+    setSlotEditor({ zone: "main", slot: "", product: null, allowSlotChange: true });
+  }
+  function openSlotTile(slot, zone) {
+    const product = products.find((p) => Number(p.slot) === Number(slot)) || null;
+    setSlotEditor({ zone, slot: String(slot), product, allowSlotChange: false });
+  }
+  function saveSlot(data) {
+    if (slotEditor?.product) updateProduct(slotEditor.product.id, data);
+    else addProduct(data);
+    setSlotEditor(null);
+  }
+  function deleteSlot() {
+    if (slotEditor?.product) deleteProduct(slotEditor.product.id);
+    setSlotEditor(null);
+  }
+
+  function addProduct(p) {
+    const next = [...products, { id: uid(), stock: 0, reorderPoint: 5, cost: 0, price: 0, ...p }];
+    persistProducts(next);
+    flash(`Added ${p.name} to slot ${p.slot}`);
+  }
+  function updateProduct(id, patch) {
+    persistProducts(products.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  }
+  function deleteProduct(id) {
+    persistProducts(products.filter((p) => p.id !== id));
+  }
+  function restock(id, qty) {
+    persistProducts(products.map((p) => (p.id === id ? { ...p, stock: Math.max(0, p.stock + qty) } : p)));
+  }
+
+  function addSale(entry) {
+    const product = products.find((p) => String(p.slot) === String(entry.slot));
+    const amount = Number(entry.amount) || 0;
+    const bill = entry.bill ? Number(entry.bill) : null;
+    const record = {
+      id: uid(),
+      date: entry.date || new Date().toISOString(),
+      slot: entry.slot,
+      zone: zoneOfSlot(entry.slot),
+      productId: product ? product.id : null,
+      name: product ? product.name : entry.name || `Slot ${entry.slot}`,
+      qty: Number(entry.qty) || 0,
+      amount,
+      bill,
+    };
+    persistSales([record, ...sales]);
+    if (product) {
+      persistProducts(
+        products.map((p) => (p.id === product.id ? { ...p, stock: Math.max(0, p.stock - record.qty) } : p))
+      );
+    }
+    if (bill) {
+      const change = bill - amount;
+      const coins = change > 0 ? Math.floor(change / COIN_DENOM) : 0;
+      if (coins > 0) dispenseCoins(coins, `Change for slot ${record.slot} (₱${bill} bill)`);
+    }
+  }
+
+  function importRows(rows) {
+    const newSales = [];
+    const stockDelta = {};
+    let coinsTotal = 0;
+    for (const r of rows) {
+      const product = products.find((p) => String(p.slot) === String(r.slot));
+      const qty = Number(r.qty) || 0;
+      const amount = Number(r.amount) || 0;
+      const bill = r.bill ? Number(r.bill) : null;
+      newSales.push({
+        id: uid(),
+        date: r.date || new Date().toISOString(),
+        slot: r.slot,
+        zone: zoneOfSlot(r.slot),
+        productId: product ? product.id : null,
+        name: product ? product.name : r.name || `Slot ${r.slot}`,
+        qty,
+        amount,
+        bill,
+      });
+      if (product) stockDelta[product.id] = (stockDelta[product.id] || 0) + qty;
+      if (bill) {
+        const change = bill - amount;
+        if (change > 0) coinsTotal += Math.floor(change / COIN_DENOM);
+      }
+    }
+    persistSales([...newSales, ...sales]);
+    persistProducts(products.map((p) => (stockDelta[p.id] ? { ...p, stock: Math.max(0, p.stock - stockDelta[p.id]) } : p)));
+    if (coinsTotal > 0) dispenseCoins(coinsTotal, `Change from ${newSales.length} imported sales`);
+    flash(`Imported ${newSales.length} sale rows`);
+  }
+
+  // ---------- Derived data ----------
+  const cutoff = period === "all" ? null : daysAgo(period - 1);
+  const scopedSales = useMemo(() => {
+    return sales.filter((s) => {
+      const dOk = !cutoff || s.date.slice(0, 10) >= cutoff;
+      const zOk = zoneFilter === "all" || s.zone === zoneFilter;
+      return dOk && zOk;
+    });
+  }, [sales, cutoff, zoneFilter]);
+
+  const totals = useMemo(() => {
+    const revenue = scopedSales.reduce((a, s) => a + s.amount, 0);
+    const units = scopedSales.reduce((a, s) => a + s.qty, 0);
+    const cost = scopedSales.reduce((a, s) => {
+      const prod = products.find((p) => p.id === s.productId);
+      return a + (prod ? prod.cost * s.qty : 0);
+    }, 0);
+    return { revenue, units, txns: scopedSales.length, profit: revenue - cost };
+  }, [scopedSales, products]);
+
+  const todayStrVal = todayStr();
+  const expensesToday = useMemo(
+    () => expenses.filter((e) => e.date.slice(0, 10) === todayStrVal).reduce((a, e) => a + e.amount, 0),
+    [expenses, todayStrVal]
+  );
+  const inventoryValue = useMemo(
+    () => products.reduce((a, p) => a + (p.stock > 0 && p.stock < 900 ? p.stock * p.price : 0), 0),
+    [products]
+  );
+
+  const topProducts = useMemo(() => {
+    const map = {};
+    for (const s of scopedSales) {
+      const key = s.productId || s.name;
+      if (!map[key]) map[key] = { name: s.name, revenue: 0, units: 0 };
+      map[key].revenue += s.amount;
+      map[key].units += s.qty;
+    }
+    return Object.values(map).sort((a, b) => b.revenue - a.revenue).slice(0, 6);
+  }, [scopedSales]);
+
+  const scopedProducts = useMemo(
+    () => products.filter((p) => zoneFilter === "all" || p.zone === zoneFilter),
+    [products, zoneFilter]
+  );
+
+  const lowStock = useMemo(
+    () => scopedProducts.filter((p) => p.stock <= p.reorderPoint).sort((a, b) => a.stock - b.stock),
+    [scopedProducts]
+  );
+
+  const velocity14 = useMemo(() => {
+    const from = daysAgo(13);
+    const map = {};
+    for (const s of sales) {
+      if (s.date.slice(0, 10) < from || !s.productId) continue;
+      map[s.productId] = (map[s.productId] || 0) + s.qty;
+    }
+    return map; // units sold per product over last 14 days
+  }, [sales]);
+
+  const lowIngredients = useMemo(
+    () => ingredients.filter((i) => i.quantity <= i.warningValue).sort((a, b) => a.quantity - b.quantity),
+    [ingredients]
+  );
+
+  const suggestions = useMemo(() => {
+    const out = [];
+    if (coinChanger.current <= 0) {
+      out.push({ level: "red", text: `Coin changer is EMPTY — the machine can't give ₱5 change. Refill now.` });
+    } else if (coinChanger.current <= coinChanger.threshold) {
+      out.push({ level: "amber", text: `Coin changer has only ${coinChanger.current} × ₱5 coins (${peso(coinChanger.current * COIN_DENOM)}) left — refill soon.` });
+    }
+    for (const ing of lowIngredients) {
+      const level = ing.quantity <= 0 ? "red" : "amber";
+      out.push({ level, text: `${ing.name} is ${ing.quantity <= 0 ? "OUT" : `low (${ing.quantity}${ing.unit})`} — this affects every coffee recipe that uses it.` });
+    }
+    for (const f of faults.slice(0, 5)) {
+      out.push({ level: "amber", text: `Failed dispense at slot ${f.slot} (${peso(f.amount)}) on ${new Date(f.date).toLocaleDateString("en-PH", { month: "short", day: "numeric" })} — worth a physical check of that coil.` });
+    }
+    for (const p of scopedProducts) {
+      const sold14 = velocity14[p.id] || 0;
+      const perDay = sold14 / 14;
+      if (p.stock <= 0) {
+        out.push({ level: "red", text: `${p.name} (slot ${p.slot}) is OUT OF STOCK — refill now.` });
+      } else if (p.stock <= p.reorderPoint) {
+        out.push({ level: "amber", text: `${p.name} (slot ${p.slot}) has ${p.stock} left — below your reorder point of ${p.reorderPoint}.` });
+      } else if (perDay > 0 && p.stock / perDay < 2) {
+        out.push({ level: "amber", text: `${p.name} (slot ${p.slot}) is selling ~${perDay.toFixed(1)}/day — at this rate it runs out in under 2 days.` });
+      }
+      if (sold14 === 0 && p.stock > 0) {
+        out.push({ level: "muted", text: `${p.name} (slot ${p.slot}) hasn't sold in 14 days — consider a price cut, promo, or swapping the slot.` });
+      }
+    }
+    const order = { red: 0, amber: 1, muted: 2 };
+    return out.sort((a, b) => order[a.level] - order[b.level]);
+  }, [scopedProducts, velocity14, coinChanger, lowIngredients, faults]);
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center min-h-[400px]" style={{ background: C.bg, color: C.cream }}>
+        <RefreshCw className="animate-spin mr-2" size={20} />
+        <span>Loading QuickNeeds ERP…</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-[600px] w-full" style={{ background: C.bg, color: C.cream, fontFamily: "system-ui, sans-serif" }}>
+      <Header totals={totals} period={period} setPeriod={setPeriod} />
+
+      {error && (
+        <div className="mx-4 mt-3 rounded-lg px-3 py-2 text-sm flex items-center justify-between" style={{ background: C.redSoft, color: C.cream }}>
+          <span className="flex items-center gap-2"><AlertTriangle size={16} /> {error}</span>
+          <button onClick={() => setError("")}><X size={16} /></button>
+        </div>
+      )}
+      {toast && (
+        <div className="mx-4 mt-3 rounded-lg px-3 py-2 text-sm flex items-center gap-2" style={{ background: C.sageSoft, color: C.cream }}>
+          <CheckCircle2 size={16} /> {toast}
+        </div>
+      )}
+
+      <TabBar tab={tab} setTab={setTab} lowStockCount={lowStock.length} coinLow={coinChanger.current <= coinChanger.threshold} ingredientsLow={lowIngredients.length} />
+
+      <div className="px-4 pb-8 pt-4">
+        {(tab === "dashboard" || tab === "slots" || tab === "products") && <ZoneFilter zoneFilter={zoneFilter} setZoneFilter={setZoneFilter} />}
+
+        {tab === "dashboard" && (
+          <Dashboard totals={totals} topProducts={topProducts} lowStock={lowStock} suggestions={suggestions} coinChanger={coinChanger} onGoToCoins={() => setTab("coins")} lowIngredients={lowIngredients} onGoToIngredients={() => setTab("ingredients")} expensesToday={expensesToday} inventoryValue={inventoryValue} itemsTracked={products.length} addExpense={addExpense} expenses={expenses} deleteExpense={deleteExpense} />
+        )}
+        {tab === "slots" && (
+          <SlotMap products={scopedProducts} zoneFilter={zoneFilter} onTapSlot={openSlotTile} />
+        )}
+        {tab === "products" && (
+          <Products products={scopedProducts} onAdd={openNewSlot} onEdit={(p) => openSlotTile(p.slot, p.zone)} deleteProduct={deleteProduct} restock={restock} onLoadRealData={loadRealMachineData} />
+        )}
+        {tab === "import" && (
+          <ImportPanel products={products} importRows={importRows} addSale={addSale} mergeProductRows={mergeProductRows} mergeIngredientRows={mergeIngredientRows} importMachineFiles={importMachineFiles} />
+        )}
+        {tab === "coins" && (
+          <CoinPanel coinChanger={coinChanger} refillCoins={refillCoins} updateCoinSettings={updateCoinSettings} />
+        )}
+        {tab === "ingredients" && (
+          <IngredientsPanel ingredients={ingredients} updateIngredient={updateIngredient} refillIngredient={refillIngredient} onLoadRealData={loadRealMachineData} />
+        )}
+      </div>
+
+      {slotEditor && (
+        <SlotEditor
+          zone={slotEditor.zone}
+          slot={slotEditor.slot}
+          product={slotEditor.product}
+          allowSlotChange={slotEditor.allowSlotChange}
+          onClose={() => setSlotEditor(null)}
+          onSave={saveSlot}
+          onDelete={slotEditor.product ? deleteSlot : null}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------- Header ----------
+function Header({ totals, period, setPeriod }) {
+  const label = period === "all" ? "all time" : period === 1 ? "today" : `last ${period} days`;
+  return (
+    <div className="px-4 pt-5 pb-4" style={{ background: C.panel, borderBottom: `1px solid ${C.line}` }}>
+      <div className="flex items-center gap-2">
+        <div className="rounded-full p-2" style={{ background: C.copper }}>
+          <Coffee size={20} color={C.bg} />
+        </div>
+        <div>
+          <div className="text-lg tracking-wide" style={{ fontFamily: "Georgia, serif" }}>QuickNeeds ERP</div>
+          <div className="text-xs" style={{ color: C.muted }}>Coffee &amp; snack vending — live from the slot map</div>
+        </div>
+      </div>
+
+      <div className="mt-4 grid grid-cols-3 gap-2">
+        <Stat label={`Sales, ${label}`} value={peso(totals.revenue)} />
+        <Stat label="Cups &amp; items sold" value={totals.units} />
+        <Stat label="Transactions" value={totals.txns} />
+      </div>
+
+      <div className="flex gap-2 mt-3">
+        {[1, 7, 30, "all"].map((p) => (
+          <button
+            key={p}
+            onClick={() => setPeriod(p)}
+            className="px-3 py-1 rounded-full text-xs"
+            style={{
+              background: period === p ? C.copper : C.panel2,
+              color: period === p ? C.bg : C.muted,
+            }}
+          >
+            {p === "all" ? "All time" : p === 1 ? "Today" : `${p}d`}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value }) {
+  return (
+    <div className="rounded-lg px-3 py-2" style={{ background: C.panel2 }}>
+      <div className="text-[10px] uppercase tracking-wide" style={{ color: C.muted }}>{label}</div>
+      <div className="text-base font-semibold" style={{ color: C.copperBright }}>{value}</div>
+    </div>
+  );
+}
+function MiniStat({ label, value, highlight }) {
+  return (
+    <div className="rounded-lg px-2 py-2 text-center" style={{ background: C.panel2 }}>
+      <div className="text-[9px] uppercase tracking-wide" style={{ color: C.muted }}>{label}</div>
+      <div className="text-sm font-semibold" style={{ color: highlight || C.cream }}>{value}</div>
+    </div>
+  );
+}
+function ExpenseQuickAdd({ addExpense }) {
+  const [amount, setAmount] = useState("");
+  const [note, setNote] = useState("");
+  return (
+    <div className="flex gap-2 mt-3">
+      <input
+        type="number"
+        value={amount}
+        onChange={(e) => setAmount(e.target.value)}
+        placeholder="₱ amount"
+        className="w-20 rounded px-2 py-1 text-xs"
+        style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}
+      />
+      <input
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        placeholder="Expense note (e.g. restock, repair)"
+        className="flex-1 rounded px-2 py-1 text-xs"
+        style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}
+      />
+      <button
+        disabled={!amount}
+        onClick={() => { addExpense(amount, note); setAmount(""); setNote(""); }}
+        className="px-3 rounded text-xs font-medium"
+        style={{ background: amount ? C.copper : C.line, color: amount ? C.bg : C.muted }}
+      >
+        Add
+      </button>
+    </div>
+  );
+}
+
+// ---------- Tabs ----------
+function TabBar({ tab, setTab, lowStockCount, coinLow, ingredientsLow }) {
+  const items = [
+    { id: "dashboard", label: "Dashboard", icon: TrendingUp },
+    { id: "slots", label: "Slot Map", icon: LayoutGrid, badge: lowStockCount },
+    { id: "products", label: "Products", icon: Settings2 },
+    { id: "ingredients", label: "Ingredients", icon: Droplets, badge: ingredientsLow },
+    { id: "import", label: "Sales", icon: Upload },
+    { id: "coins", label: "Coin Changer", icon: Coins, badge: coinLow ? "!" : 0 },
+  ];
+  return (
+    <div className="flex px-2 pt-2 gap-1 overflow-x-auto" style={{ background: C.panel }}>
+      {items.map((it) => {
+        const Icon = it.icon;
+        const active = tab === it.id;
+        return (
+          <button
+            key={it.id}
+            onClick={() => setTab(it.id)}
+            className="flex items-center gap-1.5 px-3 py-2 rounded-t-lg text-sm whitespace-nowrap relative"
+            style={{ background: active ? C.bg : "transparent", color: active ? C.copperBright : C.muted }}
+          >
+            <Icon size={15} />
+            {it.label}
+            {!!it.badge && (
+              <span className="ml-1 rounded-full text-[10px] px-1.5" style={{ background: C.red, color: C.cream }}>
+                {it.badge}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function ZoneFilter({ zoneFilter, setZoneFilter }) {
+  const opts = [
+    { id: "all", label: "Both machines" },
+    { id: "main", label: "Main (coffee)" },
+    { id: "slave", label: "Slave (snacks)" },
+  ];
+  return (
+    <div className="flex gap-2 mb-4">
+      {opts.map((o) => (
+        <button
+          key={o.id}
+          onClick={() => setZoneFilter(o.id)}
+          className="px-3 py-1.5 rounded-full text-xs border"
+          style={{
+            borderColor: C.line,
+            background: zoneFilter === o.id ? C.copper : "transparent",
+            color: zoneFilter === o.id ? C.bg : C.muted,
+          }}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ---------- Dashboard ----------
+function Dashboard({ totals, topProducts, lowStock, suggestions, coinChanger, onGoToCoins, lowIngredients, onGoToIngredients, expensesToday, inventoryValue, itemsTracked, addExpense, expenses, deleteExpense }) {
+  const coinStatus = coinChanger.current <= 0 ? "empty" : coinChanger.current <= coinChanger.threshold ? "low" : "ok";
+  const coinColor = coinStatus === "empty" ? C.red : coinStatus === "low" ? C.copperBright : C.sage;
+  const netToday = totals.profit - expensesToday;
+  return (
+    <div className="space-y-5">
+      <Panel title="Today — overall">
+        <div className="grid grid-cols-3 gap-2">
+          <MiniStat label="Item profit" value={peso(totals.profit)} />
+          <MiniStat label="Expenses" value={peso(expensesToday)} />
+          <MiniStat label="Net today" value={peso(netToday)} highlight={netToday < 0 ? C.red : C.sage} />
+        </div>
+        <ExpenseQuickAdd addExpense={addExpense} />
+        {expenses.length > 0 && (
+          <div className="mt-3 pt-2 space-y-1" style={{ borderTop: `1px solid ${C.line}` }}>
+            {expenses.slice(0, 4).map((e) => (
+              <div key={e.id} className="flex items-center justify-between text-[11px]">
+                <span style={{ color: C.muted }}>{e.note} · {new Date(e.date).toLocaleDateString("en-PH", { month: "short", day: "numeric" })}</span>
+                <span className="flex items-center gap-2">
+                  <span style={{ color: C.copperBright }}>{peso(e.amount)}</span>
+                  <button onClick={() => deleteExpense(e.id)}><X size={12} color={C.muted} /></button>
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </Panel>
+
+      <Panel title="Store snapshot">
+        <div className="grid grid-cols-3 gap-2">
+          <MiniStat label="Items tracked" value={itemsTracked} />
+          <MiniStat label="Inventory value" value={peso(inventoryValue)} />
+          <MiniStat label="Low stock" value={lowStock.length} highlight={lowStock.length ? C.copperBright : null} />
+        </div>
+      </Panel>
+
+      <div className="grid grid-cols-2 gap-3">
+        <Panel title="Coin changer" accent={coinStatus !== "ok" ? coinColor : null}>
+          <button onClick={onGoToCoins} className="w-full flex items-center justify-between">
+            <div className="text-left">
+              <div className="text-lg font-semibold" style={{ color: coinColor }}>{coinChanger.current}</div>
+              <div className="text-[10px]" style={{ color: C.muted }}>₱5 coins · {coinStatus === "empty" ? "Empty" : coinStatus === "low" ? "Low" : "OK"}</div>
+            </div>
+            <ChevronRight size={16} color={C.muted} />
+          </button>
+        </Panel>
+        <Panel title="Coffee ingredients" accent={lowIngredients.length ? C.copperBright : null}>
+          <button onClick={onGoToIngredients} className="w-full flex items-center justify-between">
+            <div className="text-left">
+              <div className="text-lg font-semibold" style={{ color: lowIngredients.length ? C.copperBright : C.sage }}>{lowIngredients.length}</div>
+              <div className="text-[10px]" style={{ color: C.muted }}>{lowIngredients.length ? "running low" : "all healthy"}</div>
+            </div>
+            <ChevronRight size={16} color={C.muted} />
+          </button>
+        </Panel>
+      </div>
+
+      <Panel title="Top sellers">
+        {topProducts.length === 0 ? (
+          <Empty text="No sales recorded yet for this period. Import a OurVend export or log a quick sale." />
+        ) : (
+          <div style={{ width: "100%", height: 220 }}>
+            <ResponsiveContainer>
+              <BarChart data={topProducts} layout="vertical" margin={{ left: 10, right: 10 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={C.line} horizontal={false} />
+                <XAxis type="number" tick={{ fill: C.muted, fontSize: 11 }} />
+                <YAxis dataKey="name" type="category" width={100} tick={{ fill: C.cream, fontSize: 11 }} />
+                <Tooltip
+                  formatter={(v) => peso(v)}
+                  contentStyle={{ background: C.panel2, border: `1px solid ${C.line}`, color: C.cream }}
+                />
+                <Bar dataKey="revenue" fill={C.copper} radius={[0, 4, 4, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+      </Panel>
+
+      <Panel title={`Stock shortages (${lowStock.length})`} accent={lowStock.length ? C.red : null}>
+        {lowStock.length === 0 ? (
+          <Empty text="Nothing below its reorder point right now." good />
+        ) : (
+          <div className="space-y-2">
+            {lowStock.map((p) => (
+              <div key={p.id} className="flex items-center justify-between rounded-lg px-3 py-2" style={{ background: p.stock <= 0 ? C.redSoft : C.panel2 }}>
+                <div>
+                  <div className="text-sm">{p.name}</div>
+                  <div className="text-[11px]" style={{ color: C.muted }}>Slot {p.slot} · {p.zone === "main" ? "Main" : "Slave"} machine</div>
+                </div>
+                <div className="text-sm font-semibold" style={{ color: p.stock <= 0 ? "#FF9E90" : C.copperBright }}>
+                  {p.stock} left
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </Panel>
+
+      <Panel title="Suggestions">
+        {suggestions.length === 0 ? (
+          <Empty text="No action needed — stock and sales look healthy." good />
+        ) : (
+          <div className="space-y-2">
+            {suggestions.map((s, i) => (
+              <div key={i} className="flex items-start gap-2 text-sm">
+                <CircleAlert size={15} style={{ marginTop: 2, color: s.level === "red" ? C.red : s.level === "amber" ? C.copperBright : C.muted, flexShrink: 0 }} />
+                <span style={{ color: s.level === "muted" ? C.muted : C.cream }}>{s.text}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="mt-4 pt-3 text-xs leading-relaxed" style={{ borderTop: `1px solid ${C.line}`, color: C.muted }}>
+          <b style={{ color: C.copperBright }}>Playbook:</b> set each reorder point near 3× the average daily sales of that slot,
+          refill on a fixed schedule (e.g. every 3 days) instead of reacting to complaints, and use the Slot Map before every refill run
+          so you carry the right stock in one trip. Retire slots that go 14 days without a sale — they're tying up capital and a coil.
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+function Panel({ title, children, accent }) {
+  return (
+    <div className="rounded-xl p-4" style={{ background: C.panel, border: `1px solid ${accent || C.line}` }}>
+      <div className="text-sm font-semibold mb-3" style={{ color: C.copperBright }}>{title}</div>
+      {children}
+    </div>
+  );
+}
+function Empty({ text, good }) {
+  return (
+    <div className="text-sm flex items-center gap-2" style={{ color: good ? C.sage : C.muted }}>
+      {good ? <CheckCircle2 size={16} /> : <Package size={16} />} {text}
+    </div>
+  );
+}
+
+// ---------- Slot Map ----------
+const ALL_MAIN_SLOTS = Array.from({ length: 100 }, (_, i) => i + 1);
+
+function SlotMap({ products, zoneFilter, onTapSlot }) {
+  const showMain = zoneFilter === "all" || zoneFilter === "main";
+  const showSlave = zoneFilter === "all" || zoneFilter === "slave";
+  return (
+    <div className="space-y-6">
+      {showMain && <SlotGrid title="Main machine — coffee (slots 1–100)" slots={ALL_MAIN_SLOTS} products={products} onTapSlot={(s) => onTapSlot(s, "main")} />}
+      {showSlave && <SlotGrid title="Slave machine — snacks &amp; drinks" slots={SLAVE_SLOTS} products={products} onTapSlot={(s) => onTapSlot(s, "slave")} />}
+      <p className="text-xs" style={{ color: C.muted }}>
+        Tap any slot to set it up or edit it. Faded tiles are physical slots with no product configured yet.
+      </p>
+    </div>
+  );
+}
+function SlotGrid({ title, slots, products, onTapSlot }) {
+  return (
+    <Panel title={title}>
+      <div className="grid grid-cols-6 sm:grid-cols-8 gap-1.5">
+        {slots.map((slot) => {
+          const p = products.find((pr) => Number(pr.slot) === Number(slot));
+          let bg = C.panel2, color = C.muted, ring = "transparent";
+          if (p) {
+            if (p.stock <= 0) { bg = C.redSoft; color = "#FF9E90"; ring = C.red; }
+            else if (p.stock <= p.reorderPoint) { bg = "#4A3A22"; color = C.copperBright; ring = C.copper; }
+            else { bg = C.sageSoft; color = "#BFDCB0"; ring = C.sage; }
+          }
+          return (
+            <button
+              key={slot}
+              onClick={() => onTapSlot(slot)}
+              title={p ? `${p.name} — ${p.stock} left` : `Slot ${slot} — tap to set up`}
+              className="rounded-md aspect-square flex flex-col items-center justify-center text-[9px] leading-tight px-0.5"
+              style={{ background: bg, color, border: `1px solid ${ring}` }}
+            >
+              <span className="font-semibold">{slot}</span>
+              {p && <span className="truncate w-full text-center">{p.name.slice(0, 6)}</span>}
+            </button>
+          );
+        })}
+      </div>
+    </Panel>
+  );
+}
+
+// ---------- Products ----------
+function Products({ products, onAdd, onEdit, deleteProduct, restock, onLoadRealData }) {
+  return (
+    <div className="space-y-4">
+      <div className="flex gap-2">
+        <button
+          onClick={onAdd}
+          className="flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium"
+          style={{ background: C.copper, color: C.bg }}
+        >
+          <Plus size={16} /> Set up a slot
+        </button>
+        <button
+          onClick={onLoadRealData}
+          title="Load your actual QuickNeeds menu, prices and stock from the OurVend screenshots"
+          className="flex items-center justify-center gap-1.5 px-3 py-2.5 rounded-lg text-xs font-medium"
+          style={{ background: C.panel2, color: C.copperBright, border: `1px solid ${C.copper}` }}
+        >
+          <Sparkles size={14} /> Load real data
+        </button>
+      </div>
+
+      {products.length === 0 ? (
+        <Empty text="No products set up yet. Tap 'Load real data' to pull in your actual QuickNeeds menu, or set up slots manually." />
+      ) : (
+        <div className="space-y-2">
+          {products
+            .slice()
+            .sort((a, b) => Number(a.slot) - Number(b.slot))
+            .map((p) => (
+              <ProductRow key={p.id} p={p} onEdit={onEdit} deleteProduct={deleteProduct} restock={restock} />
+            ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ProductRow({ p, onEdit, deleteProduct, restock }) {
+  return (
+    <div className="rounded-lg p-3" style={{ background: C.panel2 }}>
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-sm font-medium">{p.name} <span style={{ color: C.muted }}>· slot {p.slot}</span></div>
+          <div className="text-[11px]" style={{ color: C.muted }}>
+            {p.zone === "main" ? "Main / coffee" : "Slave / snack"} · cost {peso(p.cost)} · price {peso(p.price)}
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => restock(p.id, -1)} disabled={p.stock <= 0}><MinusCircle size={20} color={C.muted} /></button>
+          <span className="w-8 text-center text-sm font-semibold" style={{ color: p.stock <= p.reorderPoint ? C.copperBright : C.cream }}>{p.stock}</span>
+          <button onClick={() => restock(p.id, 1)}><PlusCircle size={20} color={C.copper} /></button>
+        </div>
+      </div>
+      <div className="flex gap-3 mt-2">
+        <button onClick={() => onEdit(p)} className="text-xs flex items-center gap-1" style={{ color: C.copperBright }}>
+          <Settings2 size={12} /> Edit
+        </button>
+        <button onClick={() => deleteProduct(p.id)} className="text-xs flex items-center gap-1" style={{ color: "#E08578" }}>
+          <Trash2 size={12} /> Remove
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function LabeledInput({ label, value, onChange, type = "text" }) {
+  return (
+    <label className="block">
+      <span style={{ color: C.muted }}>{label}</span>
+      <input
+        type={type}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="mt-0.5 w-full rounded px-2 py-1"
+        style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}
+      />
+    </label>
+  );
+}
+
+function SlotEditor({ zone: initialZone, slot: initialSlot, product, allowSlotChange, onClose, onSave, onDelete }) {
+  const [zone, setZone] = useState(initialZone || "main");
+  const [slot, setSlot] = useState(initialSlot != null ? String(initialSlot) : "");
+  const [name, setName] = useState(product?.name || "");
+  const [cost, setCost] = useState(product ? String(product.cost) : "");
+  const [price, setPrice] = useState(product ? String(product.price) : "");
+  const [stock, setStock] = useState(product ? String(product.stock) : "10");
+  const [reorderPoint, setReorderPoint] = useState(product ? String(product.reorderPoint) : "5");
+  const [capacity, setCapacity] = useState(product?.capacity != null ? String(product.capacity) : "");
+
+  const canSave = slot && name && zoneOfSlot(slot) !== "unknown";
+
+  function handleSave() {
+    onSave({
+      zone: zoneOfSlot(slot),
+      slot,
+      name,
+      cost: Number(cost) || 0,
+      price: Number(price) || 0,
+      stock: Number(stock) || 0,
+      reorderPoint: Number(reorderPoint) || 0,
+      capacity: capacity ? Number(capacity) : undefined,
+    });
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" style={{ background: "rgba(0,0,0,0.6)" }} onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} className="w-full max-w-sm rounded-xl p-4 space-y-2 max-h-[85vh] overflow-y-auto" style={{ background: C.panel2, border: `1px solid ${C.copper}` }}>
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-semibold" style={{ color: C.copperBright }}>
+            {product ? `Edit slot ${slot}` : "Set up a slot"}
+          </span>
+          <button onClick={onClose}><X size={18} color={C.muted} /></button>
+        </div>
+
+        {allowSlotChange ? (
+          <>
+            <div className="flex gap-2 text-xs">
+              <button onClick={() => { setZone("main"); setSlot(""); }} className="flex-1 py-1.5 rounded" style={{ background: zone === "main" ? C.copper : C.bg, color: zone === "main" ? C.bg : C.muted }}>Main (coffee)</button>
+              <button onClick={() => { setZone("slave"); setSlot(""); }} className="flex-1 py-1.5 rounded" style={{ background: zone === "slave" ? C.copper : C.bg, color: zone === "slave" ? C.bg : C.muted }}>Slave (snacks)</button>
+            </div>
+            {zone === "main" ? (
+              <LabeledInput label="Slot number (1–100)" type="number" value={slot} onChange={setSlot} />
+            ) : (
+              <label className="block text-xs">
+                <span style={{ color: C.muted }}>Slot</span>
+                <select value={slot} onChange={(e) => setSlot(e.target.value)} className="mt-0.5 w-full rounded px-2 py-1" style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}>
+                  <option value="">Select a slave slot…</option>
+                  {SLAVE_SLOTS.map((s) => (<option key={s} value={s}>{s}</option>))}
+                </select>
+              </label>
+            )}
+          </>
+        ) : (
+          <div className="text-xs" style={{ color: C.muted }}>
+            Slot {slot} · {zoneOfSlot(slot) === "main" ? "Main machine" : "Slave machine"}
+          </div>
+        )}
+
+        <LabeledInput label="Product name" value={name} onChange={setName} />
+        <div className="grid grid-cols-2 gap-2">
+          <LabeledInput label="Cost (₱)" type="number" value={cost} onChange={setCost} />
+          <LabeledInput label="Price (₱)" type="number" value={price} onChange={setPrice} />
+          <LabeledInput label="Current stock" type="number" value={stock} onChange={setStock} />
+          <LabeledInput label="Reorder point" type="number" value={reorderPoint} onChange={setReorderPoint} />
+          <LabeledInput label="Slot capacity (optional)" type="number" value={capacity} onChange={setCapacity} />
+          <div className="flex items-end">
+            <button
+              type="button"
+              disabled={!capacity}
+              onClick={() => setStock(capacity)}
+              className="w-full py-1.5 rounded text-[11px]"
+              style={{ background: capacity ? C.panel2 : C.line, color: capacity ? C.copperBright : C.muted, border: `1px solid ${C.line}` }}
+            >
+              Full load → {capacity || "…"}
+            </button>
+          </div>
+        </div>
+
+        <div className="flex gap-2 pt-1">
+          <button onClick={onClose} className="flex-1 py-2 rounded text-xs" style={{ background: C.bg, color: C.muted }}>Cancel</button>
+          {onDelete && (
+            <button onClick={onDelete} className="flex-1 py-2 rounded text-xs" style={{ background: C.redSoft, color: "#FF9E90" }}>
+              Remove
+            </button>
+          )}
+          <button
+            disabled={!canSave}
+            onClick={handleSave}
+            className="flex-1 py-2 rounded text-xs font-medium"
+            style={{ background: canSave ? C.copper : C.line, color: canSave ? C.bg : C.muted }}
+          >
+            Save
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Ingredients (shared coffee material box) ----------
+function IngredientsPanel({ ingredients, updateIngredient, refillIngredient, onLoadRealData }) {
+  if (ingredients.length === 0) {
+    return (
+      <div className="space-y-4">
+        <Empty text="No ingredients set up yet. These are the shared coffee-bean, powder, and cup levels your main cabinet's 13 recipes draw from." />
+        <button
+          onClick={onLoadRealData}
+          className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium"
+          style={{ background: C.copper, color: C.bg }}
+        >
+          <Sparkles size={16} /> Load real data from your machine
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      <p className="text-xs mb-2" style={{ color: C.muted }}>
+        These are shared by every coffee recipe in the main cabinet — one low ingredient can affect several drinks at once.
+      </p>
+      {ingredients.map((ing) => (
+        <IngredientRow key={ing.id} ing={ing} updateIngredient={updateIngredient} refillIngredient={refillIngredient} />
+      ))}
+    </div>
+  );
+}
+function IngredientRow({ ing, updateIngredient, refillIngredient }) {
+  const [editing, setEditing] = useState(false);
+  const [addQty, setAddQty] = useState("");
+  const low = ing.quantity <= ing.warningValue;
+  const empty = ing.quantity <= 0;
+  const color = empty ? C.red : low ? C.copperBright : C.sage;
+  return (
+    <div className="rounded-lg p-3" style={{ background: C.panel2, border: low ? `1px solid ${color}` : "none" }}>
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-sm font-medium">{ing.name}</div>
+          <div className="text-[11px]" style={{ color: C.muted }}>Warning below {ing.warningValue}{ing.unit}</div>
+        </div>
+        <div className="text-base font-semibold" style={{ color }}>{ing.quantity}{ing.unit}</div>
+      </div>
+      <div className="flex gap-2 mt-2 items-center">
+        <input
+          type="number"
+          value={addQty}
+          onChange={(e) => setAddQty(e.target.value)}
+          placeholder={`Add ${ing.unit}`}
+          className="flex-1 rounded px-2 py-1 text-xs"
+          style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}
+        />
+        <button
+          disabled={!addQty}
+          onClick={() => { refillIngredient(ing.id, Number(addQty)); setAddQty(""); }}
+          className="px-3 py-1 rounded text-xs font-medium"
+          style={{ background: addQty ? C.copper : C.line, color: addQty ? C.bg : C.muted }}
+        >
+          Add
+        </button>
+        <button onClick={() => setEditing((e) => !e)} className="text-xs" style={{ color: C.copperBright }}>
+          <Settings2 size={14} />
+        </button>
+      </div>
+      {editing && (
+        <div className="grid grid-cols-2 gap-2 mt-2 text-xs">
+          <LabeledInput label="Set quantity" type="number" value={ing.quantity} onChange={(v) => updateIngredient(ing.id, { quantity: Number(v) })} />
+          <LabeledInput label="Warning threshold" type="number" value={ing.warningValue} onChange={(v) => updateIngredient(ing.id, { warningValue: Number(v) })} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Coin Changer ----------
+function CoinPanel({ coinChanger, refillCoins, updateCoinSettings }) {
+  const [addQty, setAddQty] = useState("");
+  const [capacity, setCapacity] = useState(String(coinChanger.capacity));
+  const [threshold, setThreshold] = useState(String(coinChanger.threshold));
+  const pct = Math.min(100, Math.round((coinChanger.current / (coinChanger.capacity || 1)) * 100));
+  const status = coinChanger.current <= 0 ? "empty" : coinChanger.current <= coinChanger.threshold ? "low" : "ok";
+  const statusColor = status === "empty" ? C.red : status === "low" ? C.copperBright : C.sage;
+
+  return (
+    <div className="space-y-5">
+      <Panel title="₱5 coin level" accent={status !== "ok" ? statusColor : null}>
+        <div className="flex items-center gap-2 mb-2">
+          <Banknote size={18} color={statusColor} />
+          <span className="text-2xl font-semibold" style={{ color: statusColor }}>{coinChanger.current}</span>
+          <span className="text-xs" style={{ color: C.muted }}>/ {coinChanger.capacity} coins · {peso(coinChanger.current * COIN_DENOM)}</span>
+        </div>
+        <div className="h-2 rounded-full overflow-hidden" style={{ background: C.bg }}>
+          <div style={{ width: `${pct}%`, background: statusColor, height: "100%" }} />
+        </div>
+        <div className="text-[11px] mt-1" style={{ color: C.muted }}>
+          Machine takes ₱20/₱50/₱100 bills and gives change only in ₱5 coins — this tracks that coin hopper.
+        </div>
+      </Panel>
+
+      <Panel title="Refill the changer">
+        <div className="flex gap-2 mb-2">
+          {[20, 50, 100].map((q) => (
+            <button key={q} onClick={() => refillCoins(q)} className="flex-1 py-2 rounded text-xs font-medium" style={{ background: C.panel2, color: C.copperBright, border: `1px solid ${C.line}` }}>
+              +{q} coins
+            </button>
+          ))}
+        </div>
+        <div className="flex gap-2">
+          <input
+            type="number"
+            value={addQty}
+            onChange={(e) => setAddQty(e.target.value)}
+            placeholder="Custom amount"
+            className="flex-1 rounded px-2 py-2 text-xs"
+            style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}
+          />
+          <button
+            disabled={!addQty}
+            onClick={() => { refillCoins(Number(addQty)); setAddQty(""); }}
+            className="px-4 rounded text-xs font-medium"
+            style={{ background: addQty ? C.copper : C.line, color: addQty ? C.bg : C.muted }}
+          >
+            Add
+          </button>
+        </div>
+      </Panel>
+
+      <Panel title="Settings">
+        <div className="grid grid-cols-2 gap-2 text-xs">
+          <LabeledInput label="Hopper capacity (coins)" type="number" value={capacity} onChange={setCapacity} />
+          <LabeledInput label="Low-stock threshold" type="number" value={threshold} onChange={setThreshold} />
+        </div>
+        <button
+          onClick={() => updateCoinSettings({ capacity: Number(capacity) || coinChanger.capacity, threshold: Number(threshold) || coinChanger.threshold })}
+          className="mt-2 w-full py-2 rounded text-xs font-medium"
+          style={{ background: C.copper, color: C.bg }}
+        >
+          Save settings
+        </button>
+      </Panel>
+
+      <Panel title="Recent activity">
+        {coinChanger.log.length === 0 ? (
+          <Empty text="No refills or change-outs logged yet." />
+        ) : (
+          <div className="space-y-1.5 text-xs">
+            {coinChanger.log.slice(0, 20).map((e) => (
+              <div key={e.id} className="flex items-center justify-between">
+                <span style={{ color: C.muted }}>
+                  {new Date(e.date).toLocaleString("en-PH", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} · {e.note}
+                </span>
+                <span style={{ color: e.type === "refill" ? C.sage : C.copperBright }}>
+                  {e.type === "refill" ? "+" : "-"}{e.coins}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+// ---------- Photo import (uses Claude's own vision via the in-artifact API) ----------
+const VISION_PROMPT = `You are reading a screenshot from a vending-machine management app (OurVend / Yunshu Smart IoT). Identify which of two screen types this is and extract the visible data with EXACT numbers — never guess, round, or invent a value.
+
+TYPE A — "slots": a grid of coil/slot cards. Each card shows a slot number, a product image, a product name, a price (in ₱), and sometimes "Capacity: N" with a current count next to +/- buttons. Return:
+{"type":"slots","items":[{"slot":"101","name":"Marty's Spicy","price":35,"capacity":4,"stock":3,"confidence":"high"}]}
+
+TYPE B — "ingredients": a "Coffee bean box" / "Material box" replenishment screen listing powder or material names with a residual quantity, a unit (g / ml / individual), and a warning value. Return:
+{"type":"ingredients","items":[{"name":"Sugar","quantity":942,"unit":"g","warningValue":200,"confidence":"high"}]}
+
+Rules:
+- Read every visible card or row in the image, not just the first few.
+- If a field is cut off, blurry, partially hidden, or not shown, set it to null and set that item's "confidence" to "low" — never invent a number to fill the gap.
+- Slot numbers, prices, and quantities must match exactly what is printed on screen, digit for digit.
+- Respond with ONLY the JSON object described above. No markdown code fences, no commentary, no explanation before or after.`;
+
+function PhotoImportPanel({ mergeProductRows, mergeIngredientRows }) {
+  const [analyzing, setAnalyzing] = useState(false);
+  const [photoError, setPhotoError] = useState("");
+  const [result, setResult] = useState(null); // { type, items: [...] }
+  const [included, setIncluded] = useState({});
+  const [summary, setSummary] = useState("");
+
+  async function handleFile(e) {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setSummary(""); setPhotoError(""); setResult(null); setAnalyzing(true);
+    try {
+      const base64 = await fileToBase64(file);
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 1000,
+          messages: [{
+            role: "user",
+            content: [
+              { type: "image", source: { type: "base64", media_type: file.type || "image/jpeg", data: base64 } },
+              { type: "text", text: VISION_PROMPT },
+            ],
+          }],
+        }),
+      });
+      const data = await resp.json();
+      const textBlocks = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+      const clean = textBlocks.replace(/```json|```/g, "").trim();
+      const parsed = JSON.parse(clean);
+      if (!parsed || !Array.isArray(parsed.items) || parsed.items.length === 0) {
+        throw new Error("No items recognized");
+      }
+      setResult(parsed);
+      const inc = {};
+      parsed.items.forEach((_, i) => { inc[i] = true; });
+      setIncluded(inc);
+    } catch (err) {
+      setPhotoError("Couldn't read that screenshot clearly — try a sharper, well-lit photo with the cards fully visible, or enter it manually below.");
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  function confirm() {
+    const rows = result.items.filter((_, i) => included[i]);
+    if (rows.length === 0) { setResult(null); return; }
+    const res = result.type === "ingredients" ? mergeIngredientRows(rows) : mergeProductRows(rows);
+    const skippedPart = res.skipped ? `, ${res.skipped} skipped (unrecognized slot)` : "";
+    setSummary(`Saved from photo: ${res.added} added, ${res.updated} updated${skippedPart}.`);
+    setResult(null);
+  }
+
+  const includedCount = Object.values(included).filter(Boolean).length;
+
+  return (
+    <Panel title="Import from a photo">
+      <p className="text-xs mb-2" style={{ color: C.muted }}>
+        Snap or upload a screenshot of your OurVend slot screen or Material box screen — this reads slot numbers, names, prices, and stock straight off the picture and fills them in. Always check the preview before saving; anything the reader isn't sure about is flagged.
+      </p>
+      <label className="flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium cursor-pointer" style={{ background: analyzing ? C.line : C.copper, color: analyzing ? C.muted : C.bg }}>
+        <Camera size={16} /> {analyzing ? "Reading photo…" : "Add a photo"}
+        <input type="file" accept="image/*" capture="environment" className="hidden" onChange={handleFile} disabled={analyzing} />
+      </label>
+
+      {analyzing && (
+        <div className="flex items-center gap-2 text-xs mt-2" style={{ color: C.muted }}>
+          <RefreshCw className="animate-spin" size={14} /> Reading slot numbers, names, prices…
+        </div>
+      )}
+      {photoError && (
+        <div className="text-xs mt-2 flex items-start gap-2" style={{ color: "#E08578" }}>
+          <AlertTriangle size={14} style={{ marginTop: 1, flexShrink: 0 }} /> {photoError}
+        </div>
+      )}
+      {summary && (
+        <div className="text-xs mt-2 flex items-center gap-2" style={{ color: C.sage }}>
+          <CheckCircle2 size={14} /> {summary}
+        </div>
+      )}
+
+      {result && (
+        <div className="mt-3 space-y-2">
+          <p className="text-[11px]" style={{ color: C.muted }}>
+            Read as {result.type === "ingredients" ? "an ingredients / material screen" : "a slot screen"} — {result.items.length} item{result.items.length === 1 ? "" : "s"} found. Uncheck anything wrong before saving.
+          </p>
+          <div className="rounded overflow-hidden max-h-64 overflow-y-auto" style={{ border: `1px solid ${C.line}` }}>
+            {result.items.map((it, i) => (
+              <label key={i} className="flex items-center gap-2 px-2 py-1.5 text-[11px]" style={{ borderTop: i ? `1px solid ${C.line}` : "none", background: it.confidence === "low" ? C.redSoft : "transparent" }}>
+                <input type="checkbox" checked={!!included[i]} onChange={(e) => setIncluded((s) => ({ ...s, [i]: e.target.checked }))} />
+                {result.type === "ingredients" ? (
+                  <span>{it.name ?? "?"} — {it.quantity ?? "?"}{it.unit ?? ""} <span style={{ color: C.muted }}>(warn {it.warningValue ?? "?"})</span></span>
+                ) : (
+                  <span>Slot {it.slot ?? "?"} — {it.name ?? "?"} · ₱{it.price ?? "?"}{it.capacity != null ? ` · cap ${it.capacity}` : ""}{it.stock != null ? ` · stock ${it.stock}` : ""}</span>
+                )}
+                {it.confidence === "low" && <span className="ml-auto text-[10px] flex-shrink-0" style={{ color: "#FF9E90" }}>check this</span>}
+              </label>
+            ))}
+          </div>
+          <button
+            disabled={includedCount === 0}
+            onClick={confirm}
+            className="w-full py-2 rounded text-xs font-medium"
+            style={{ background: includedCount ? C.copper : C.line, color: includedCount ? C.bg : C.muted }}
+          >
+            Save checked items ({includedCount})
+          </button>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ---------- File import (real OurVend export files: Give-out record, Money record) ----------
+function FileImportPanel({ importMachineFiles }) {
+  const [processing, setProcessing] = useState(false);
+  const [fileError, setFileError] = useState("");
+  const [lastSummary, setLastSummary] = useState("");
+
+  function detectKind(headers) {
+    const set = new Set(headers.map((h) => (h || "").trim()));
+    if (set.has("Slot Number") && set.has("Price") && set.has("Result")) return "giveout";
+    if (set.has("Amount to be refunded") && set.has("Amount of coin payment")) return "money";
+    if (set.has("Payment type") && set.has("Sales amount")) return "summary";
+    if (set.has("Machine ID") && set.has("Sales amount")) return "summary";
+    return "unknown";
+  }
+  function readCSV(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const res = Papa.parse(reader.result, { header: true, skipEmptyLines: true });
+        resolve({ headers: res.meta.fields || [], rows: res.data });
+      };
+      reader.onerror = () => reject(new Error("Could not read " + file.name));
+      reader.readAsText(file);
+    });
+  }
+  function readSheet(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const wb = XLSX.read(reader.result, { type: "array", cellDates: true });
+          const sheet = wb.Sheets[wb.SheetNames[0]];
+          const rows = XLSX.utils.sheet_to_json(sheet, { defval: null });
+          const headers = rows.length ? Object.keys(rows[0]) : [];
+          resolve({ headers, rows });
+        } catch (e) { reject(e); }
+      };
+      reader.onerror = () => reject(new Error("Could not read " + file.name));
+      reader.readAsArrayBuffer(file);
+    });
+  }
+
+  async function handleFiles(e) {
+    const files = Array.from(e.target.files || []);
+    e.target.value = "";
+    if (!files.length) return;
+    setProcessing(true); setFileError(""); setLastSummary("");
+    try {
+      const parsed = [];
+      for (const file of files) {
+        const isCsv = /\.csv$/i.test(file.name);
+        const { headers, rows } = isCsv ? await readCSV(file) : await readSheet(file);
+        parsed.push({ kind: detectKind(headers), rows });
+      }
+      const known = parsed.filter((p) => p.kind === "giveout" || p.kind === "money");
+      const summaryOnly = parsed.filter((p) => p.kind === "summary").length;
+      const unknownCount = parsed.filter((p) => p.kind === "unknown").length;
+      const res = known.length ? importMachineFiles(known) : { salesAdded: 0, faultsAdded: 0, coinsFromFile: 0 };
+      const bits = [];
+      if (res.salesAdded) bits.push(`${res.salesAdded} sales`);
+      if (res.faultsAdded) bits.push(`${res.faultsAdded} failed dispenses flagged`);
+      if (res.coinsFromFile) bits.push(`${res.coinsFromFile} coins tracked`);
+      if (summaryOnly) bits.push(`${summaryOnly} summary file(s) skipped (already covered by Give-out record)`);
+      if (unknownCount) setFileError(`Couldn't recognize ${unknownCount} file(s) — expecting a Give-out record or Money record export from OurVend.`);
+      setLastSummary(bits.length ? `Done: ${bits.join(", ")}.` : unknownCount ? "" : "No new data found in those files.");
+    } catch (err) {
+      setFileError("Something went wrong reading one of those files. Make sure they're unmodified exports from OurVend.");
+    } finally {
+      setProcessing(false);
+    }
+  }
+
+  return (
+    <Panel title="Upload machine reports">
+      <p className="text-xs mb-2" style={{ color: C.muted }}>
+        Upload export files straight from OurVend — Give-out record (.xls) and Money record (.csv) are read automatically:
+        each slot/price/result row becomes a sale, and coin change events update the coin changer. Pick multiple files at once.
+      </p>
+      <label className="flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium cursor-pointer" style={{ background: processing ? C.line : C.copper, color: processing ? C.muted : C.bg }}>
+        <Upload size={16} /> {processing ? "Reading files…" : "Upload report files"}
+        <input type="file" accept=".csv,.xls,.xlsx" multiple className="hidden" onChange={handleFiles} disabled={processing} />
+      </label>
+      {processing && (
+        <div className="flex items-center gap-2 text-xs mt-2" style={{ color: C.muted }}>
+          <RefreshCw className="animate-spin" size={14} /> Reading and matching slot numbers…
+        </div>
+      )}
+      {fileError && (
+        <div className="text-xs mt-2 flex items-start gap-2" style={{ color: "#E08578" }}>
+          <AlertTriangle size={14} style={{ marginTop: 1, flexShrink: 0 }} /> {fileError}
+        </div>
+      )}
+      {lastSummary && (
+        <div className="text-xs mt-2 flex items-center gap-2" style={{ color: C.sage }}>
+          <CheckCircle2 size={14} /> {lastSummary}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+// ---------- Import ----------
+function ImportPanel({ products, importRows, addSale, mergeProductRows, mergeIngredientRows, importMachineFiles }) {
+  const [raw, setRaw] = useState("");
+  const [hasHeader, setHasHeader] = useState(true);
+  const [parsed, setParsed] = useState(null); // {fields, rows}
+  const [mapping, setMapping] = useState({ slot: "", qty: "", amount: "", name: "", date: "", bill: "" });
+  const [quickSlot, setQuickSlot] = useState("");
+  const [quickQty, setQuickQty] = useState("1");
+  const [quickAmount, setQuickAmount] = useState("");
+  const [quickBill, setQuickBill] = useState("");
+
+  function guessMap(fields) {
+    const find = (patterns) => fields.find((f) => patterns.some((p) => f.toLowerCase().includes(p))) || "";
+    return {
+      slot: find(["slot", "device", "coil", "channel", "mdb"]),
+      qty: find(["qty", "quantity", "count", "vend"]),
+      amount: find(["amount", "total", "revenue", "sales", "price"]),
+      name: find(["item", "product", "name", "goods"]),
+      date: find(["date", "time"]),
+      bill: find(["bill", "tender", "insert", "paid"]),
+    };
+  }
+
+  function handleParse() {
+    if (!raw.trim()) return;
+    const res = Papa.parse(raw.trim(), { header: hasHeader, skipEmptyLines: true });
+    if (hasHeader) {
+      const fields = res.meta.fields || [];
+      setParsed({ fields, rows: res.data });
+      setMapping(guessMap(fields));
+    } else {
+      // treat columns as index-based fields "0","1",...
+      const fields = res.data[0] ? res.data[0].map((_, i) => String(i)) : [];
+      const rows = res.data.map((arr) => Object.fromEntries(arr.map((v, i) => [String(i), v])));
+      setParsed({ fields, rows });
+      setMapping({ slot: "", qty: "", amount: "", name: "", date: "" });
+    }
+  }
+
+  const ready = parsed && mapping.slot && mapping.qty && mapping.amount;
+  const preview = parsed ? parsed.rows.slice(0, 5) : [];
+
+  function confirmImport() {
+    const rows = parsed.rows
+      .map((r) => ({
+        slot: r[mapping.slot],
+        qty: r[mapping.qty],
+        amount: String(r[mapping.amount]).replace(/[₱,]/g, ""),
+        name: mapping.name ? r[mapping.name] : undefined,
+        date: mapping.date ? new Date(r[mapping.date]).toISOString() : new Date().toISOString(),
+        bill: mapping.bill ? String(r[mapping.bill]).replace(/[₱,]/g, "") : undefined,
+      }))
+      .filter((r) => r.slot);
+    importRows(rows);
+    setRaw(""); setParsed(null);
+  }
+
+  return (
+    <div className="space-y-5">
+      <FileImportPanel importMachineFiles={importMachineFiles} />
+      <PhotoImportPanel mergeProductRows={mergeProductRows} mergeIngredientRows={mergeIngredientRows} />
+
+      <Panel title="Paste CSV manually (fallback)">
+        <p className="text-xs mb-2" style={{ color: C.muted }}>
+          Only needed if a file won't upload above, or you're pasting from somewhere other than OurVend.
+        </p>
+        <textarea
+          value={raw}
+          onChange={(e) => setRaw(e.target.value)}
+          placeholder="Paste exported rows here…"
+          rows={5}
+          className="w-full rounded px-2 py-1.5 text-xs"
+          style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}
+        />
+        <label className="flex items-center gap-2 text-xs mt-2" style={{ color: C.muted }}>
+          <input type="checkbox" checked={hasHeader} onChange={(e) => setHasHeader(e.target.checked)} /> First row is a header
+        </label>
+        <button onClick={handleParse} className="mt-2 px-3 py-1.5 rounded text-xs" style={{ background: C.copper, color: C.bg }}>
+          Parse
+        </button>
+
+        {parsed && (
+          <div className="mt-4 space-y-2 text-xs">
+            <div className="grid grid-cols-2 gap-2">
+              <MapSelect label="Slot column" fields={parsed.fields} value={mapping.slot} onChange={(v) => setMapping((m) => ({ ...m, slot: v }))} />
+              <MapSelect label="Qty column" fields={parsed.fields} value={mapping.qty} onChange={(v) => setMapping((m) => ({ ...m, qty: v }))} />
+              <MapSelect label="Amount column" fields={parsed.fields} value={mapping.amount} onChange={(v) => setMapping((m) => ({ ...m, amount: v }))} />
+              <MapSelect label="Name column (optional)" fields={parsed.fields} value={mapping.name} onChange={(v) => setMapping((m) => ({ ...m, name: v }))} />
+              <MapSelect label="Bill inserted column (optional)" fields={parsed.fields} value={mapping.bill} onChange={(v) => setMapping((m) => ({ ...m, bill: v }))} />
+            </div>
+            <p className="text-[10px]" style={{ color: C.muted }}>
+              If your export includes the bill inserted, mapping it lets the app estimate ₱5 coins given as change and keep the coin changer level accurate.
+            </p>
+            {preview.length > 0 && (
+              <div className="overflow-x-auto rounded" style={{ border: `1px solid ${C.line}` }}>
+                <table className="w-full text-[10px]">
+                  <thead><tr>{parsed.fields.map((f) => (<th key={f} className="px-2 py-1 text-left" style={{ color: C.muted }}>{f}</th>))}</tr></thead>
+                  <tbody>
+                    {preview.map((row, i) => (
+                      <tr key={i} style={{ borderTop: `1px solid ${C.line}` }}>
+                        {parsed.fields.map((f) => (<td key={f} className="px-2 py-1">{String(row[f] ?? "")}</td>))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <button
+              disabled={!ready}
+              onClick={confirmImport}
+              className="w-full py-2 rounded text-xs font-medium"
+              style={{ background: ready ? C.copper : C.line, color: ready ? C.bg : C.muted }}
+            >
+              Confirm import ({parsed.rows.length} rows)
+            </button>
+          </div>
+        )}
+      </Panel>
+
+      <Panel title="Quick sale (manual)">
+        <p className="text-xs mb-2" style={{ color: C.muted }}>Log a single sale on the spot — useful for cash sales or testing.</p>
+        <div className="grid grid-cols-3 gap-2 text-xs">
+          <LabeledInput label="Slot" value={quickSlot} onChange={setQuickSlot} />
+          <LabeledInput label="Qty" type="number" value={quickQty} onChange={setQuickQty} />
+          <LabeledInput label="Amount (₱)" type="number" value={quickAmount} onChange={setQuickAmount} />
+        </div>
+        <label className="block text-xs mt-2">
+          <span style={{ color: C.muted }}>Bill inserted (optional — tracks ₱5 coin change given)</span>
+          <select value={quickBill} onChange={(e) => setQuickBill(e.target.value)} className="mt-0.5 w-full rounded px-2 py-1" style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}>
+            <option value="">Unknown / exact change</option>
+            {BILL_DENOMS.map((b) => (<option key={b} value={b}>₱{b}</option>))}
+          </select>
+        </label>
+        <button
+          disabled={!quickSlot || !quickAmount}
+          onClick={() => { addSale({ slot: quickSlot, qty: quickQty, amount: quickAmount, bill: quickBill }); setQuickSlot(""); setQuickQty("1"); setQuickAmount(""); setQuickBill(""); }}
+          className="mt-2 w-full py-2 rounded text-xs font-medium"
+          style={{ background: quickSlot && quickAmount ? C.copper : C.line, color: C.bg }}
+        >
+          <span className="flex items-center justify-center gap-1"><ChevronRight size={14} /> Log sale</span>
+        </button>
+      </Panel>
+    </div>
+  );
+}
+
+function MapSelect({ label, fields, value, onChange }) {
+  return (
+    <label className="block">
+      <span style={{ color: C.muted }}>{label}</span>
+      <select value={value} onChange={(e) => onChange(e.target.value)} className="mt-0.5 w-full rounded px-2 py-1" style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}>
+        <option value="">—</option>
+        {fields.map((f) => (<option key={f} value={f}>{f}</option>))}
+      </select>
+    </label>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(React.createElement(QuickNeedsERP));
+</script>
+</body>
+</html>
