@@ -8,8 +8,6 @@
 <meta name="apple-mobile-web-app-title" content="QuickNeeds" />
 <meta name="theme-color" content="#241712" />
 <title>QuickNeeds ERP</title>
-
-<!-- Firebase (compat build — no bundler needed, works as plain script tags) -->
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 
@@ -28,9 +26,7 @@
 <div id="root"></div>
 
 <script>
-// =====================================================================
-// 1) PASTE YOUR FIREBASE CONFIG HERE — from Firebase Console > Project settings > General > Your apps
-// =====================================================================
+
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyCPcr48Fd2SrI7FzvpSBP3Onsf8krR_0dw",
   authDomain: "quickneeds-erp.firebaseapp.com",
@@ -42,10 +38,8 @@ const FIREBASE_CONFIG = {
 
 firebase.initializeApp(FIREBASE_CONFIG);
 const db = firebase.firestore();
-const KV_COLLECTION = "quickneeds_kv"; // all app data is stored as one doc per key in this collection
+const KV_COLLECTION = "quickneeds_kv";
 
-// Storage shim: gives the app the same window.storage.get/set/delete/list API it uses inside Claude,
-// backed by Firestore instead — so no app code below needed to change.
 window.storage = {
   get: function (key) {
     return db.collection(KV_COLLECTION).doc(key).get().then(function (snap) {
@@ -71,6 +65,7 @@ window.storage = {
     }).catch(function () { return null; });
   },
 };
+
 </script>
 
 <script type="text/babel" data-presets="react">
@@ -95,6 +90,7 @@ function mkIcon(glyph) {
     );
   };
 }
+
 const Coffee = mkIcon("\u2615");
 const AlertTriangle = mkIcon("\u26A0\uFE0F");
 const TrendingUp = mkIcon("\uD83D\uDCC8");
@@ -116,6 +112,11 @@ const Banknote = mkIcon("\uD83D\uDCB5");
 const Droplets = mkIcon("\uD83D\uDCA7");
 const Camera = mkIcon("\uD83D\uDCF7");
 const Sparkles = mkIcon("\u2728");
+const BarChart3 = mkIcon("\uD83D\uDCCA");
+const Download = mkIcon("\u2B07\uFE0F");
+const Receipt = mkIcon("\uD83E\uDDFE");
+const FlaskConical = mkIcon("\uD83E\uDDEA");
+const Calendar = mkIcon("\uD83D\uDCC5");
 
 
 // ---------- Machine layout ----------
@@ -134,10 +135,19 @@ function zoneOfSlot(slot) {
   return "unknown";
 }
 
+// ---------- Item categories: coffee (main zone) vs drinks / snacks (slave zone) ----------
+const DRINK_KEYWORDS = ["water","summit","gatorade","pocari","kombucha","coke","sprite","royal","mug","pepsi","cobra","sting","juice","soda","energy","rootbeer","vanilla"];
+function inferCategory(zone, name) {
+  if (zone === "main") return "coffee";
+  const n = (name || "").toLowerCase();
+  return DRINK_KEYWORDS.some((k) => n.includes(k)) ? "drinks" : "snacks";
+}
+const CATEGORY_LABEL = { coffee: "Coffee", drinks: "Drinks", snacks: "Snacks" };
+
 // ---------- Cash acceptor: bills in, coin-only change out ----------
 const BILL_DENOMS = [20, 50, 100];
 const COIN_DENOM = 5;
-const DEFAULT_COIN_CHANGER = { capacity: 200, current: 0, threshold: 40, log: [] };
+const DEFAULT_COIN_CHANGER = { capacity: 2500, current: 0, threshold: 400, log: [] };
 
 // ---------- Real machine data (from OurVend Replenishment management screens) ----------
 const REAL_MAIN_PRODUCTS = [
@@ -266,9 +276,31 @@ function fileToBase64(file) {
     r.readAsDataURL(file);
   });
 }
+// Resize + compress a photo client-side before storing it (keeps each record well under Firestore's 1MB doc limit).
+function resizeImageFile(file, maxDim = 900, quality = 0.6) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const reader = new FileReader();
+    reader.onload = () => { img.src = reader.result; };
+    reader.onerror = () => reject(new Error("Could not read photo"));
+    img.onload = () => {
+      let { width, height } = img;
+      if (width > height && width > maxDim) { height = Math.round((height * maxDim) / width); width = maxDim; }
+      else if (height > maxDim) { width = Math.round((width * maxDim) / height); height = maxDim; }
+      const canvas = document.createElement("canvas");
+      canvas.width = width; canvas.height = height;
+      canvas.getContext("2d").drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL("image/jpeg", quality));
+    };
+    img.onerror = () => reject(new Error("Could not decode photo"));
+    reader.readAsDataURL(file);
+  });
+}
 
 function QuickNeedsERP() {
   const [loading, setLoading] = useState(true);
+  const [testMode, setTestMode] = useState(false);
+  function k(base) { return testMode ? "test:" + base : base; } // Test Mode uses a fully separate storage namespace
   const [products, setProducts] = useState([]);
   const [sales, setSales] = useState([]);
   const [coinChanger, setCoinChanger] = useState(DEFAULT_COIN_CHANGER);
@@ -278,19 +310,21 @@ function QuickNeedsERP() {
   const [tab, setTab] = useState("dashboard");
   const [zoneFilter, setZoneFilter] = useState("all");
   const [period, setPeriod] = useState(7);
+  const [customRange, setCustomRange] = useState(null); // { from: 'YYYY-MM-DD', to: 'YYYY-MM-DD' } | null
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
   const [slotEditor, setSlotEditor] = useState(null); // { zone, slot, product, allowSlotChange } | null
 
   useEffect(() => {
+    setLoading(true);
     (async () => {
       const [p, s, c, ing, exp, flt] = await Promise.all([
-        loadJSON("quickneeds:products", []),
-        loadJSON("quickneeds:sales", []),
-        loadJSON("quickneeds:coins", DEFAULT_COIN_CHANGER),
-        loadJSON("quickneeds:ingredients", []),
-        loadJSON("quickneeds:expenses", []),
-        loadJSON("quickneeds:faults", []),
+        loadJSON(k("quickneeds:products"), []),
+        loadJSON(k("quickneeds:sales"), []),
+        loadJSON(k("quickneeds:coins"), DEFAULT_COIN_CHANGER),
+        loadJSON(k("quickneeds:ingredients"), []),
+        loadJSON(k("quickneeds:expenses"), []),
+        loadJSON(k("quickneeds:faults"), []),
       ]);
       setProducts(p);
       setSales(s);
@@ -300,7 +334,7 @@ function QuickNeedsERP() {
       setFaults(flt);
       setLoading(false);
     })();
-  }, []);
+  }, [testMode]);
 
   function flash(msg) {
     setToast(msg);
@@ -309,22 +343,22 @@ function QuickNeedsERP() {
 
   async function persistProducts(next) {
     setProducts(next);
-    const ok = await saveJSON("quickneeds:products", next);
+    const ok = await saveJSON(k("quickneeds:products"), next);
     if (!ok) setError("Could not save product changes. They may not persist.");
   }
   async function persistSales(next) {
     setSales(next);
-    const ok = await saveJSON("quickneeds:sales", next);
+    const ok = await saveJSON(k("quickneeds:sales"), next);
     if (!ok) setError("Could not save sales changes. They may not persist.");
   }
   async function persistCoinChanger(next) {
     setCoinChanger(next);
-    const ok = await saveJSON("quickneeds:coins", next);
+    const ok = await saveJSON(k("quickneeds:coins"), next);
     if (!ok) setError("Could not save coin changer changes. They may not persist.");
   }
   async function persistIngredients(next) {
     setIngredients(next);
-    const ok = await saveJSON("quickneeds:ingredients", next);
+    const ok = await saveJSON(k("quickneeds:ingredients"), next);
     if (!ok) setError("Could not save ingredient changes. They may not persist.");
   }
   function updateIngredient(id, patch) {
@@ -339,11 +373,12 @@ function QuickNeedsERP() {
     const existingBySlot = new Set(products.map((p) => String(p.slot)));
     const newMain = REAL_MAIN_PRODUCTS.filter((r) => !existingBySlot.has(String(r.slot))).map((r) => ({
       id: uid(), zone: "main", slot: String(r.slot), name: r.name, price: r.price, cost: 0,
-      stock: 999, reorderPoint: 0,
+      stock: 999, reorderPoint: 0, category: "coffee",
     }));
     const newSlave = REAL_SLAVE_PRODUCTS.filter((r) => !existingBySlot.has(String(r.slot))).map((r) => ({
       id: uid(), zone: "slave", slot: String(r.slot), name: r.name, price: r.price, cost: 0,
       stock: r.stock, reorderPoint: Math.max(1, Math.ceil(r.capacity * 0.3)), capacity: r.capacity,
+      category: inferCategory("slave", r.name),
     }));
     const addedProducts = newMain.length + newSlave.length;
     if (addedProducts) persistProducts([...products, ...newMain, ...newSlave]);
@@ -386,6 +421,7 @@ function QuickNeedsERP() {
           stock: r.stock != null ? Number(r.stock) : zone === "main" ? 999 : capacity || 5,
           reorderPoint: zone === "main" ? 0 : Math.max(1, Math.ceil((capacity || 5) * 0.3)),
           capacity,
+          category: inferCategory(zone, r.name),
         });
         added++;
       }
@@ -432,7 +468,7 @@ function QuickNeedsERP() {
     const entry = { id: uid(), date: new Date().toISOString(), type: "dispense", coins: qty, note: note || "Change given" };
     setCoinChanger((cur) => {
       const next = { ...cur, current: Math.max(0, cur.current - qty), log: [entry, ...cur.log].slice(0, 200) };
-      saveJSON("quickneeds:coins", next);
+      saveJSON(k("quickneeds:coins"), next);
       return next;
     });
   }
@@ -442,12 +478,12 @@ function QuickNeedsERP() {
 
   async function persistExpenses(next) {
     setExpenses(next);
-    const ok = await saveJSON("quickneeds:expenses", next);
+    const ok = await saveJSON(k("quickneeds:expenses"), next);
     if (!ok) setError("Could not save expense changes. They may not persist.");
   }
-  function addExpense(amount, note) {
+  function addExpense(amount, note, photo) {
     if (!amount) return;
-    const entry = { id: uid(), date: new Date().toISOString(), amount: Number(amount), note: note || "Expense" };
+    const entry = { id: uid(), date: new Date().toISOString(), amount: Number(amount), note: note || "Expense", photo: photo || null };
     persistExpenses([entry, ...expenses]);
     flash(`Logged expense: ${peso(amount)}`);
   }
@@ -456,7 +492,7 @@ function QuickNeedsERP() {
   }
   async function persistFaults(next) {
     setFaults(next);
-    const ok = await saveJSON("quickneeds:faults", next);
+    const ok = await saveJSON(k("quickneeds:faults"), next);
     if (!ok) setError("Could not save fault log. It may not persist.");
   }
 
@@ -613,14 +649,19 @@ function QuickNeedsERP() {
   }
 
   // ---------- Derived data ----------
-  const cutoff = period === "all" ? null : daysAgo(period - 1);
+  const dateBounds = useMemo(() => {
+    if (customRange && customRange.from && customRange.to) return { from: customRange.from, to: customRange.to };
+    if (period === "all") return { from: null, to: null };
+    return { from: daysAgo(period - 1), to: todayStr() };
+  }, [period, customRange]);
   const scopedSales = useMemo(() => {
     return sales.filter((s) => {
-      const dOk = !cutoff || s.date.slice(0, 10) >= cutoff;
+      const d = s.date.slice(0, 10);
+      const dOk = (!dateBounds.from || d >= dateBounds.from) && (!dateBounds.to || d <= dateBounds.to);
       const zOk = zoneFilter === "all" || s.zone === zoneFilter;
       return dOk && zOk;
     });
-  }, [sales, cutoff, zoneFilter]);
+  }, [sales, dateBounds, zoneFilter]);
 
   const totals = useMemo(() => {
     const revenue = scopedSales.reduce((a, s) => a + s.amount, 0);
@@ -710,6 +751,53 @@ function QuickNeedsERP() {
     return out.sort((a, b) => order[a.level] - order[b.level]);
   }, [scopedProducts, velocity14, coinChanger, lowIngredients, faults]);
 
+  // Fast/slow movers per category, based on units sold within the current date range + zone filter
+  const moversByCategory = useMemo(() => {
+    const unitsByProduct = {};
+    for (const s of scopedSales) {
+      if (!s.productId) continue;
+      unitsByProduct[s.productId] = (unitsByProduct[s.productId] || 0) + s.qty;
+    }
+    const cats = { coffee: [], drinks: [], snacks: [] };
+    for (const p of products) {
+      const cat = p.category || inferCategory(p.zone, p.name);
+      if (zoneFilter !== "all" && p.zone !== zoneFilter) continue;
+      const units = unitsByProduct[p.id] || 0;
+      const revenue = units * p.price;
+      (cats[cat] || cats.snacks).push({ id: p.id, name: p.name, slot: p.slot, units, revenue });
+    }
+    const result = {};
+    for (const cat of Object.keys(cats)) {
+      const sorted = cats[cat].slice().sort((a, b) => b.units - a.units);
+      result[cat] = {
+        fast: sorted.slice(0, 5),
+        slow: sorted.slice().sort((a, b) => a.units - b.units).slice(0, 5),
+        total: cats[cat].length,
+      };
+    }
+    return result;
+  }, [scopedSales, products, zoneFilter]);
+
+  function exportSalesCSV() {
+    const rows = [["Date", "Slot", "Zone", "Category", "Product", "Qty", "Amount (₱)"]];
+    for (const s of scopedSales.slice().sort((a, b) => a.date.localeCompare(b.date))) {
+      const prod = products.find((p) => p.id === s.productId);
+      const cat = prod ? prod.category || inferCategory(prod.zone, prod.name) : "";
+      rows.push([s.date.slice(0, 16).replace("T", " "), s.slot, s.zone, cat, s.name, s.qty, s.amount]);
+    }
+    const csv = rows.map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const label = dateBounds.from ? `${dateBounds.from}_to_${dateBounds.to}` : "all-time";
+    a.href = url;
+    a.download = `quickneeds-sales_${label}${testMode ? "_TEST" : ""}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[400px]" style={{ background: C.bg, color: C.cream }}>
@@ -721,7 +809,12 @@ function QuickNeedsERP() {
 
   return (
     <div className="min-h-[600px] w-full" style={{ background: C.bg, color: C.cream, fontFamily: "system-ui, sans-serif" }}>
-      <Header totals={totals} period={period} setPeriod={setPeriod} />
+      {testMode && (
+        <div className="px-4 py-1.5 text-center text-xs font-semibold tracking-wide" style={{ background: "#4A3416", color: "#F2C572" }}>
+          🧪 TEST MODE — nothing here touches your real sales, stock, or coins
+        </div>
+      )}
+      <Header totals={totals} period={period} setPeriod={setPeriod} customRange={customRange} setCustomRange={setCustomRange} testMode={testMode} setTestMode={setTestMode} />
 
       {error && (
         <div className="mx-4 mt-3 rounded-lg px-3 py-2 text-sm flex items-center justify-between" style={{ background: C.redSoft, color: C.cream }}>
@@ -738,7 +831,7 @@ function QuickNeedsERP() {
       <TabBar tab={tab} setTab={setTab} lowStockCount={lowStock.length} coinLow={coinChanger.current <= coinChanger.threshold} ingredientsLow={lowIngredients.length} />
 
       <div className="px-4 pb-8 pt-4">
-        {(tab === "dashboard" || tab === "slots" || tab === "products") && <ZoneFilter zoneFilter={zoneFilter} setZoneFilter={setZoneFilter} />}
+        {(tab === "dashboard" || tab === "slots" || tab === "products" || tab === "reports") && <ZoneFilter zoneFilter={zoneFilter} setZoneFilter={setZoneFilter} />}
 
         {tab === "dashboard" && (
           <Dashboard totals={totals} topProducts={topProducts} lowStock={lowStock} suggestions={suggestions} coinChanger={coinChanger} onGoToCoins={() => setTab("coins")} lowIngredients={lowIngredients} onGoToIngredients={() => setTab("ingredients")} expensesToday={expensesToday} inventoryValue={inventoryValue} itemsTracked={products.length} addExpense={addExpense} expenses={expenses} deleteExpense={deleteExpense} />
@@ -748,6 +841,9 @@ function QuickNeedsERP() {
         )}
         {tab === "products" && (
           <Products products={scopedProducts} onAdd={openNewSlot} onEdit={(p) => openSlotTile(p.slot, p.zone)} deleteProduct={deleteProduct} restock={restock} onLoadRealData={loadRealMachineData} />
+        )}
+        {tab === "reports" && (
+          <ReportsPanel moversByCategory={moversByCategory} exportSalesCSV={exportSalesCSV} dateBounds={dateBounds} scopedSales={scopedSales} />
         )}
         {tab === "import" && (
           <ImportPanel products={products} importRows={importRows} addSale={addSale} mergeProductRows={mergeProductRows} mergeIngredientRows={mergeIngredientRows} importMachineFiles={importMachineFiles} />
@@ -776,18 +872,29 @@ function QuickNeedsERP() {
 }
 
 // ---------- Header ----------
-function Header({ totals, period, setPeriod }) {
-  const label = period === "all" ? "all time" : period === 1 ? "today" : `last ${period} days`;
+function Header({ totals, period, setPeriod, customRange, setCustomRange, testMode, setTestMode }) {
+  const [showCustom, setShowCustom] = useState(false);
+  const label = customRange ? `${customRange.from} → ${customRange.to}` : period === "all" ? "all time" : period === 1 ? "today" : `last ${period} days`;
   return (
     <div className="px-4 pt-5 pb-4" style={{ background: C.panel, borderBottom: `1px solid ${C.line}` }}>
-      <div className="flex items-center gap-2">
-        <div className="rounded-full p-2" style={{ background: C.copper }}>
-          <Coffee size={20} color={C.bg} />
+      <div className="flex items-center gap-2 justify-between">
+        <div className="flex items-center gap-2">
+          <div className="rounded-full p-2" style={{ background: C.copper }}>
+            <Coffee size={20} color={C.bg} />
+          </div>
+          <div>
+            <div className="text-lg tracking-wide" style={{ fontFamily: "Georgia, serif" }}>QuickNeeds ERP</div>
+            <div className="text-xs" style={{ color: C.muted }}>Coffee &amp; snack vending — live from the slot map</div>
+          </div>
         </div>
-        <div>
-          <div className="text-lg tracking-wide" style={{ fontFamily: "Georgia, serif" }}>QuickNeeds ERP</div>
-          <div className="text-xs" style={{ color: C.muted }}>Coffee &amp; snack vending — live from the slot map</div>
-        </div>
+        <button
+          onClick={() => setTestMode(!testMode)}
+          title="Test Mode uses a completely separate dataset — nothing here touches real sales or stock"
+          className="flex items-center gap-1 px-2 py-1 rounded-full text-[10px] flex-shrink-0"
+          style={{ background: testMode ? "#4A3416" : C.panel2, color: testMode ? "#F2C572" : C.muted, border: `1px solid ${testMode ? "#F2C572" : C.line}` }}
+        >
+          <FlaskConical size={12} /> {testMode ? "Test ON" : "Test"}
+        </button>
       </div>
 
       <div className="mt-4 grid grid-cols-3 gap-2">
@@ -796,21 +903,48 @@ function Header({ totals, period, setPeriod }) {
         <Stat label="Transactions" value={totals.txns} />
       </div>
 
-      <div className="flex gap-2 mt-3">
+      <div className="flex gap-2 mt-3 flex-wrap">
         {[1, 7, 30, "all"].map((p) => (
           <button
             key={p}
-            onClick={() => setPeriod(p)}
+            onClick={() => { setPeriod(p); setCustomRange(null); setShowCustom(false); }}
             className="px-3 py-1 rounded-full text-xs"
             style={{
-              background: period === p ? C.copper : C.panel2,
-              color: period === p ? C.bg : C.muted,
+              background: !customRange && period === p ? C.copper : C.panel2,
+              color: !customRange && period === p ? C.bg : C.muted,
             }}
           >
             {p === "all" ? "All time" : p === 1 ? "Today" : `${p}d`}
           </button>
         ))}
+        <button
+          onClick={() => setShowCustom((s) => !s)}
+          className="px-3 py-1 rounded-full text-xs flex items-center gap-1"
+          style={{ background: customRange ? C.copper : C.panel2, color: customRange ? C.bg : C.muted }}
+        >
+          <Calendar size={12} /> Custom
+        </button>
       </div>
+
+      {showCustom && (
+        <div className="flex items-center gap-2 mt-2 text-xs">
+          <input
+            type="date"
+            defaultValue={customRange?.from}
+            onChange={(e) => setCustomRange((r) => ({ from: e.target.value, to: r?.to || todayStr() }))}
+            className="rounded px-2 py-1"
+            style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}
+          />
+          <span style={{ color: C.muted }}>to</span>
+          <input
+            type="date"
+            defaultValue={customRange?.to}
+            onChange={(e) => setCustomRange((r) => ({ from: r?.from || daysAgo(6), to: e.target.value }))}
+            className="rounded px-2 py-1"
+            style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -834,31 +968,63 @@ function MiniStat({ label, value, highlight }) {
 function ExpenseQuickAdd({ addExpense }) {
   const [amount, setAmount] = useState("");
   const [note, setNote] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const [photoBusy, setPhotoBusy] = useState(false);
+
+  async function handlePhoto(e) {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setPhotoBusy(true);
+    try {
+      const dataUrl = await resizeImageFile(file);
+      setPhoto(dataUrl);
+    } catch (err) {
+      // silently ignore — the expense can still be logged without a photo
+    } finally {
+      setPhotoBusy(false);
+    }
+  }
+
   return (
-    <div className="flex gap-2 mt-3">
-      <input
-        type="number"
-        value={amount}
-        onChange={(e) => setAmount(e.target.value)}
-        placeholder="₱ amount"
-        className="w-20 rounded px-2 py-1 text-xs"
-        style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}
-      />
-      <input
-        value={note}
-        onChange={(e) => setNote(e.target.value)}
-        placeholder="Expense note (e.g. restock, repair)"
-        className="flex-1 rounded px-2 py-1 text-xs"
-        style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}
-      />
-      <button
-        disabled={!amount}
-        onClick={() => { addExpense(amount, note); setAmount(""); setNote(""); }}
-        className="px-3 rounded text-xs font-medium"
-        style={{ background: amount ? C.copper : C.line, color: amount ? C.bg : C.muted }}
-      >
-        Add
-      </button>
+    <div className="mt-3 space-y-2">
+      <div className="flex gap-2">
+        <input
+          type="number"
+          value={amount}
+          onChange={(e) => setAmount(e.target.value)}
+          placeholder="₱ amount"
+          className="w-20 rounded px-2 py-1 text-xs"
+          style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}
+        />
+        <input
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="Expense note (e.g. restock, repair)"
+          className="flex-1 rounded px-2 py-1 text-xs"
+          style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}
+        />
+      </div>
+      <div className="flex items-center gap-2">
+        <label className="flex items-center gap-1.5 px-2.5 py-1.5 rounded text-[11px] cursor-pointer" style={{ background: C.panel2, color: C.copperBright, border: `1px solid ${C.line}` }}>
+          <Receipt size={12} /> {photoBusy ? "Reading…" : photo ? "Receipt attached" : "Attach receipt"}
+          <input type="file" accept="image/*" className="hidden" onChange={handlePhoto} disabled={photoBusy} />
+        </label>
+        {photo && (
+          <>
+            <img src={photo} alt="Receipt preview" className="h-9 w-9 object-cover rounded" style={{ border: `1px solid ${C.line}` }} />
+            <button onClick={() => setPhoto(null)}><X size={14} color={C.muted} /></button>
+          </>
+        )}
+        <button
+          disabled={!amount}
+          onClick={() => { addExpense(amount, note, photo); setAmount(""); setNote(""); setPhoto(null); }}
+          className="ml-auto px-3 py-1.5 rounded text-xs font-medium"
+          style={{ background: amount ? C.copper : C.line, color: amount ? C.bg : C.muted }}
+        >
+          Add
+        </button>
+      </div>
     </div>
   );
 }
@@ -869,6 +1035,7 @@ function TabBar({ tab, setTab, lowStockCount, coinLow, ingredientsLow }) {
     { id: "dashboard", label: "Dashboard", icon: TrendingUp },
     { id: "slots", label: "Slot Map", icon: LayoutGrid, badge: lowStockCount },
     { id: "products", label: "Products", icon: Settings2 },
+    { id: "reports", label: "Reports", icon: BarChart3 },
     { id: "ingredients", label: "Ingredients", icon: Droplets, badge: ingredientsLow },
     { id: "import", label: "Sales", icon: Upload },
     { id: "coins", label: "Coin Changer", icon: Coins, badge: coinLow ? "!" : 0 },
@@ -943,8 +1110,15 @@ function Dashboard({ totals, topProducts, lowStock, suggestions, coinChanger, on
           <div className="mt-3 pt-2 space-y-1" style={{ borderTop: `1px solid ${C.line}` }}>
             {expenses.slice(0, 4).map((e) => (
               <div key={e.id} className="flex items-center justify-between text-[11px]">
-                <span style={{ color: C.muted }}>{e.note} · {new Date(e.date).toLocaleDateString("en-PH", { month: "short", day: "numeric" })}</span>
-                <span className="flex items-center gap-2">
+                <span className="flex items-center gap-1.5 min-w-0">
+                  {e.photo && (
+                    <a href={e.photo} target="_blank" rel="noreferrer">
+                      <img src={e.photo} alt="Receipt" className="h-6 w-6 object-cover rounded flex-shrink-0" style={{ border: `1px solid ${C.line}` }} />
+                    </a>
+                  )}
+                  <span style={{ color: C.muted }} className="truncate">{e.note} · {new Date(e.date).toLocaleDateString("en-PH", { month: "short", day: "numeric" })}</span>
+                </span>
+                <span className="flex items-center gap-2 flex-shrink-0">
                   <span style={{ color: C.copperBright }}>{peso(e.amount)}</span>
                   <button onClick={() => deleteExpense(e.id)}><X size={12} color={C.muted} /></button>
                 </span>
@@ -1199,6 +1373,7 @@ function SlotEditor({ zone: initialZone, slot: initialSlot, product, allowSlotCh
   const [stock, setStock] = useState(product ? String(product.stock) : "10");
   const [reorderPoint, setReorderPoint] = useState(product ? String(product.reorderPoint) : "5");
   const [capacity, setCapacity] = useState(product?.capacity != null ? String(product.capacity) : "");
+  const [category, setCategory] = useState(product?.category || inferCategory(initialZone || "main", product?.name || ""));
 
   const canSave = slot && name && zoneOfSlot(slot) !== "unknown";
 
@@ -1212,6 +1387,7 @@ function SlotEditor({ zone: initialZone, slot: initialSlot, product, allowSlotCh
       stock: Number(stock) || 0,
       reorderPoint: Number(reorderPoint) || 0,
       capacity: capacity ? Number(capacity) : undefined,
+      category,
     });
   }
 
@@ -1250,6 +1426,14 @@ function SlotEditor({ zone: initialZone, slot: initialSlot, product, allowSlotCh
         )}
 
         <LabeledInput label="Product name" value={name} onChange={setName} />
+        <label className="block text-xs">
+          <span style={{ color: C.muted }}>Category</span>
+          <select value={category} onChange={(e) => setCategory(e.target.value)} className="mt-0.5 w-full rounded px-2 py-1" style={{ background: C.bg, color: C.cream, border: `1px solid ${C.line}` }}>
+            <option value="coffee">Coffee</option>
+            <option value="drinks">Drinks</option>
+            <option value="snacks">Snacks</option>
+          </select>
+        </label>
         <div className="grid grid-cols-2 gap-2">
           <LabeledInput label="Cost (₱)" type="number" value={cost} onChange={setCost} />
           <LabeledInput label="Price (₱)" type="number" value={price} onChange={setPrice} />
@@ -1359,6 +1543,62 @@ function IngredientRow({ ing, updateIngredient, refillIngredient }) {
           <LabeledInput label="Warning threshold" type="number" value={ing.warningValue} onChange={(v) => updateIngredient(ing.id, { warningValue: Number(v) })} />
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------- Reports: fast/slow movers per category + CSV export ----------
+const CATEGORY_ORDER = ["coffee", "drinks", "snacks"];
+function ReportsPanel({ moversByCategory, exportSalesCSV, dateBounds, scopedSales }) {
+  const rangeLabel = dateBounds.from ? `${dateBounds.from} to ${dateBounds.to}` : "all time";
+  return (
+    <div className="space-y-5">
+      <Panel title="Export">
+        <p className="text-xs mb-2" style={{ color: C.muted }}>
+          Downloads a CSV of every sale in the current range ({rangeLabel}) — change the date range up top (presets or Custom) before exporting. Opens directly in Excel or Google Sheets.
+        </p>
+        <button
+          onClick={exportSalesCSV}
+          disabled={scopedSales.length === 0}
+          className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium"
+          style={{ background: scopedSales.length ? C.copper : C.line, color: scopedSales.length ? C.bg : C.muted }}
+        >
+          <Download size={16} /> Download sales CSV ({scopedSales.length} rows)
+        </button>
+      </Panel>
+
+      {CATEGORY_ORDER.map((cat) => {
+        const data = moversByCategory[cat];
+        if (!data || data.total === 0) return null;
+        return (
+          <Panel key={cat} title={`${CATEGORY_LABEL[cat]} — fast &amp; slow movers`}>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <div className="text-[10px] uppercase tracking-wide mb-1" style={{ color: C.sage }}>Fast movers</div>
+                {data.fast.filter((i) => i.units > 0).length === 0 ? (
+                  <div className="text-[11px]" style={{ color: C.muted }}>No sales yet</div>
+                ) : (
+                  data.fast.filter((i) => i.units > 0).map((i) => (
+                    <div key={i.id} className="text-[11px] flex justify-between py-0.5">
+                      <span className="truncate pr-1">{i.name}</span>
+                      <span style={{ color: C.copperBright, flexShrink: 0 }}>{i.units}</span>
+                    </div>
+                  ))
+                )}
+              </div>
+              <div>
+                <div className="text-[10px] uppercase tracking-wide mb-1" style={{ color: C.muted }}>Slow movers</div>
+                {data.slow.map((i) => (
+                  <div key={i.id} className="text-[11px] flex justify-between py-0.5">
+                    <span className="truncate pr-1" style={{ color: i.units === 0 ? "#E08578" : C.cream }}>{i.name}</span>
+                    <span style={{ color: C.muted, flexShrink: 0 }}>{i.units}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </Panel>
+        );
+      })}
     </div>
   );
 }
